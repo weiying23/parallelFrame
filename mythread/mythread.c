@@ -34,8 +34,12 @@ int getnt_();
 
 // #define FUNCTION_NUM (sizeof(fun_names) / sizeof(fun_names[0]))
 int sync_flag_init = 6666;  // 同步标志初始值
-// void  thread_run();
-// TFunc thread_func;
+__attribute__((weak)) 
+void thread_run() {
+  // 默认空实现，Fortran 用户应提供自己的实现
+  printf("Warning: using default thread_run(), please define your own.\n");
+};
+
 void  multithreadsync_();
 void  MultiThreadSync() ;
 void  multithreadsync_() {MultiThreadSync() ;}
@@ -52,15 +56,6 @@ void  MultiThreadSync(){
     mSetSubs(ti->sync_flag);
   }
 }
-
-// 默认的 thread_run 实现（弱符号，用户可覆盖）
-// #ifndef _WIN32
-// __attribute__((weak))
-// #endif
-// void thread_run(void) {
-//     // 默认空实现，Fortran 用户应提供自己的实现
-//     printf("Warning: using default thread_run(), please define your own.\n");
-// }
 
 void initthreads_(int *mpi_id_,int *NCorePClu_ ,int *NCluPNode_,int *NCorePGrp_,int *NThPGrp_,int *NGrpPProc_,int *NProcPNode_,int *ManageCoreId_,int *err){
   *err=InitThreads(*mpi_id_,*NCorePClu_,* NCluPNode_,* NCorePGrp_,*NThPGrp_,*NGrpPProc_,*NProcPNode_,ManageCoreId_);
@@ -683,7 +678,7 @@ void initmd(){
         pti->pg=pgi;
         pti->threads=pgi->threads;
         //printf("pti->ind:%d \n",j);
-        pti->ind=j;
+        pti->ind=j+1;
         pti->sync_flag = sync_flag_init;
         pti->Nthreads=pgi->Nthreads;
         //printf("Nthread1:%d\n",pgi->Nthreads);
@@ -732,7 +727,7 @@ void initmd(){
         void *ss=hmalloc(nsize);
         pti->td=hmalloc(nsize);
       }
-      pti->ind=j+1;
+      pti->ind=j + 1;
       pti->sync_flag = sync_flag_init;
       
       pti->indg=cbase+j+1;

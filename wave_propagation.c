@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h> 
 #include <math.h>
 #include <mpi.h>
 #include "mythread/mythread.h"
@@ -24,7 +25,7 @@
 #define DT          0.001   // 时间步长
 #define C           1.0     // 波速
 #define N_GROUPS    2       // 每进程线程组数
-#define N_THREADS   4       // 每组工作线程数（不含主线程）
+#define N_THREADS   3       // 每组工作线程数
 
 //  Courant 条件：c*dt/dx <= 1/sqrt(2) 对于2D
 #define COURANT     (C * DT / DX)
@@ -150,10 +151,10 @@ static void worker_thread() {
         SWG;
         
         // 更新波场
-        // update_wavefield(wf);
+        update_wavefield(wf);
         
         // 计算局部能量
-        // wf->energy = compute_energy(wf);
+        wf->energy = compute_energy(wf);
         
         // 通知组主线程完成
         SSG;
@@ -182,16 +183,16 @@ static void group_main_thread() {
         GSS;
         
         // 组主也参与计算（最后一行，避免边界问题）
-        // update_wavefield(wf);
+        update_wavefield(wf);
         
         // 等待所有工作线程完成
         GWS;
         
         // 交换时间层
-        // swap_buffers(wf);
+        swap_buffers(wf);
         
         // 计算组总能量
-        // double group_energy = wf->energy;
+        double group_energy = wf->energy;
         // 收集工作线程的能量（简化，实际应该汇总）
         
         // 通知主线程本组完成
@@ -219,9 +220,9 @@ static void main_thread() {
         // 通知所有组开始计算
         MSG;
 
-        GSS;
+        // GSS;
 
-        GWS;
+        // GWS;
         
         // 等待所有组完成
         MWG;
@@ -252,14 +253,16 @@ static void main_thread() {
 void thread_run() {
     int tid = gettid();
     int gid = ti->igrp;
+    printf("[INFO] MPI=%d, Group=%d, Thread=%d finished\n", mpi_id, gid, tid);
+
+    // sleep(30);
     
-    if (tid == 0) {
-        if (ThreadG && gid > 0) {
-            group_main_thread();
-        } else {
-            main_thread();
-        }
-    } else {
+    if (gid == -1) {
+        main_thread();
+    } else if (tid==1){
+        group_main_thread();
+    }
+    else {
         worker_thread();
     }
 }
@@ -365,7 +368,7 @@ int main(int argc, char *argv[]) {
     int NThPGrp = N_THREADS ;
     int NGrpPProc = N_GROUPS;
     int NProcPNode = mpi_size;
-    int ManageCoreId = -1;
+    int ManageCoreId = -2;
     
     // 初始化线程系统
     int err = InitThreads(mpi_rank, NCorePClu, NCluPNode, NCorePGrp, 

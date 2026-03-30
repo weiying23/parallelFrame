@@ -74,7 +74,7 @@ typedef struct _threadProc{
   THREADINFO threads[MCOREPC];
   threadGroup *grps[MCLUST];
   int volatile state;       //SWM MSS 
-  int gstate[(MCLUST)*MSB]; //MWG GSM 
+  int volatile gstate[(MCLUST)*MSB]; //MWG GSM 
   void*locv[8];
 }threadProc;
 
