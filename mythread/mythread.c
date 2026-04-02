@@ -22,15 +22,7 @@ __thread void*gd=NULL;
 int ThreadG=-1; //分组标志
 int mpi_id,NCorePClu=38,NCluPNode=16,NCorePGrp=38,NGrpPProc=4 ,NThPGrp=7 ,NProcPNode=16,ManageCoreId=-1,NThreads=3;
 static void zStartThreads(TFunc tfun,void*para,int detach,int clear);
-
-
-//void gettid_(int *td);
-int gettid();
-int gettid_();
-
-// void getnt_(int *nt);
-int getnt();
-int getnt_();
+static int select_locv(int typ,short **pnlocv,void ***plocv);
 
 // #define FUNCTION_NUM (sizeof(fun_names) / sizeof(fun_names[0]))
 int sync_flag_init = 6666;  // 同步标志初始值
@@ -39,22 +31,9 @@ void thread_run() {
   // 默认空实现，Fortran 用户应提供自己的实现
   printf("Warning: using default thread_run(), please define your own.\n");
 };
-
-void  multithreadsync_();
-void  MultiThreadSync() ;
-void  multithreadsync_() {MultiThreadSync() ;}
-void  MultiThreadSync(){
-  ti->sync_flag = ti->sync_flag + 1;
-  if(ti->ind)
-  {
-    sSetState(ti->sync_flag);
-    sWaitState(ti->sync_flag);
-  }
-  else 
-  {
-    mWaitSubs(ti->sync_flag);
-    mSetSubs(ti->sync_flag);
-  }
+__attribute__((weak))
+int GetVInt(int volatile *volatile p){
+  return *p;
 }
 
 void initthreads_(int *mpi_id_,int *NCorePClu_ ,int *NCluPNode_,int *NCorePGrp_,int *NThPGrp_,int *NGrpPProc_,int *NProcPNode_,int *ManageCoreId_,int *err){
@@ -68,6 +47,23 @@ void endthreads_(){
 }
 void initdatasize(int tsize,int gsize){
 }
+void setthread(int NCorePClu_,int NThPGrp_,int NGrpPProc_,int NProcPNode_,int ManageCoreId_){
+  if(NCorePClu_>0){
+    NCorePClu=NCorePClu_;
+    NCorePGrp=NCorePClu_;
+  }
+  if(NThPGrp_>0){
+    NThPGrp=NThPGrp_;
+  }
+  if(NGrpPProc_>0){
+    NGrpPProc=NGrpPProc_;
+  }
+  if(NProcPNode_>0){
+    NProcPNode=NProcPNode_;
+  }
+  ManageCoreId=ManageCoreId_;
+  ThreadG=(NGrpPProc>1);
+}
 
 // 弱符号定义：用户代码可以覆盖
 __attribute__((weak)) int _getgdsize_(){
@@ -77,75 +73,88 @@ __attribute__((weak)) int _gettdsize_(){
   return sizeof(float);
 }
 
-//void gettid_(int *td){  *td = ti->ind; }
 int gettid(){ return ti->ind; }
-int gettid_(){ return ti->ind; }
 
-// void getnt_(int *nt){ *nt =  ti->Nthreads; }
 int getnt(){ return ti->Nthreads; }
-int getnt_(){ return ti->Nthreads; }
 void _threadmain_(HTHREADINFO ti){
   bindcpu(ti->indg);
   ti->tfun();
 }
 #undef T
 #undef F
-void SetLocV(int typ,int ind,void*p){
-  short*pnlocv=NULL,nlocv=0;
-  void***plocv=NULL,**pl;
+static int select_locv(int typ,short **pnlocv,void ***plocv){
   if(typ==0){
-    pnlocv=&ti->nlocv;
-    plocv=(void***)&ti->locv;
-  }else if(typ==1){
-    pnlocv=&gi->nlocv;
-    plocv =(void***)&gi->locv;
-  }else if(typ==1){
-    pnlocv=&md.nlocv;
-    plocv =(void***)&md.locv;
+    if(!ti) return -1;
+    *pnlocv=&ti->nlocv;
+    *plocv=ti->locv;
+    return 0;
+  }
+  if(typ==1){
+    if(!gi) return -1;
+    *pnlocv=&gi->nlocv;
+    *plocv=gi->locv;
+    return 0;
+  }
+  if(typ==2){
+    *pnlocv=&md.nlocv;
+    *plocv=md.locv;
+    return 0;
+  }
+  return -1;
+}
+void SetLocV(int typ,int ind,void*p){
+  short *pnlocv=NULL;
+  void **pl=NULL;
+  int nlocv=0;
+  if(select_locv(typ,&pnlocv,&pl)!=0){
+    return;
   }
   if(ind<0||ind>100){
     return ;
   }
-  pl=*plocv;
   nlocv=*pnlocv;
   if(ind<8){
     pl[ind]=p;
   }else{
-    void **pp=(void**)&pl[7];
+    void **pp=(void**)pl[7];
     if(nlocv<=ind){
+      int old_extra=(nlocv>7)?(nlocv-7):0;
+      int new_nlocv=ind+4;
+      int new_extra=new_nlocv-7;
+      pp=hrealloc(pp,(size_t)new_extra*sizeof(*pp));
+      if(!pp){
+        return;
+      }
+      memset(pp+old_extra,0,(size_t)(new_extra-old_extra)*sizeof(*pp));
+      pl[7]=pp;
       *pnlocv=ind+4;
-      *pp=hrealloc(*pp,*pnlocv-7);
-      memset(pp+nlocv-7,0,(*pnlocv-nlocv)*sizeof(*plocv));
     }
     pp[ind-7]=p;
   }
 }
 void *GetLocV(int typ,int ind,void*p){
-  short*pnlocv=NULL,nlocv=0;
-  void***plocv=NULL,**pl;
-  if(typ==0){
-    pnlocv=&ti->nlocv;
-    plocv=(void***)&ti->locv;
-  }else if(typ==1){
-    pnlocv=&gi->nlocv;
-    plocv =(void***)&gi->locv;
-  }else if(typ==1){
-    pnlocv=&md.nlocv;
-    plocv =(void***)&md.locv;
+  short *pnlocv=NULL;
+  void **pl=NULL;
+  (void)p;
+  if(select_locv(typ,&pnlocv,&pl)!=0){
+    return NULL;
   }
   if(ind<0||ind>100){
-    return plocv+1;
+    return NULL;
   }
   if(*pnlocv<=ind){
     return NULL;
   }
-  void**pp=*plocv;
-  if(ind<8) return pp[ind];
-  pp=(void**)pp[7];
+  if(ind<8) return pl[ind];
+  void **pp=(void**)pl[7];
+  if(!pp){
+    return NULL;
+  }
   return pp[ind-7];
 }
 int InitThreads(int mpi_id_,int NCorePClu_ ,int NCluPNode_,int NCorePGrp_,int NThPGrp_,int NGrpPProc_,int NProcPNode_,int *ManageCoreId_){
   mpi_id      =mpi_id_;
+  md.mpi_id   =mpi_id_;
 #define VD(d,v) if(v>0)d=v;
   VD(NCorePClu   ,NCorePClu_);
   VD(NCluPNode   ,NCluPNode_);
@@ -170,8 +179,8 @@ int InitThreads(int mpi_id_,int NCorePClu_ ,int NCluPNode_,int NCorePGrp_,int NT
     printf("NGrpPProc %d biger than surported MCLUST %d\n",NGrpPProc,MCLUST);
     return (-3);
   }
-  if(NGrpPProc>MCLUST){
-    printf("NGrpPProc %d biger than surported MCLUST %d\n",NGrpPProc,MCLUST);
+  if(NCluPNode>MCLUST){
+    printf("NCluPNode %d biger than surported MCLUST %d\n",NCluPNode,MCLUST);
     return (-4);
   }
   if(NProcPNode > MCLUST){
@@ -179,6 +188,12 @@ int InitThreads(int mpi_id_,int NCorePClu_ ,int NCluPNode_,int NCorePGrp_,int NT
     return (-5);
   }
   initmd();
+  NThreads=ThreadG?1:md.Nthreads;
+  if(ThreadG){
+    for(int i=0;i<md.ngrp;i++){
+      NThreads+=md.grps[i]->Nthreads;
+    }
+  }
   *ManageCoreId_=ManageCoreId;
   return 0;
 }
@@ -192,13 +207,13 @@ void threadMain(HTHREADINFO pti){
 }
 void StartThreads(TFunc tfun){
   
-  zStartThreads(tfun,0,1,1);
+  zStartThreads(tfun,0,0,1);
   //printf("startthreads over\n");
 }
 void EndThreads(){
  // printf("End multithread comput\n");
 
-  zStartThreads(NULL,0,1,1);
+  zStartThreads(NULL,0,0,1);
   //printf("endthreads over\n");
 }
 int bindcpu(int id){
@@ -218,7 +233,6 @@ void bindthread_(){
   bindthread();
 }
 threadProc md={0};
-int GetVInt(int volatile *volatile p);
 void ntdelay(int n){
   usleep(n/20);
   //static int vt=0; for(int i=0;i<n;i++) vt=(vt*1357+2581);
@@ -306,14 +320,14 @@ void mWaitSubs(int state){
 #endif
 }
 void mWaitSubsr(int state){
-  for(int i=0;i<md.Nthreads;i++){
+  for(int i=0;i<md.Nthreads-1;i++){
     Wait_LLE(&md.threads[i].state,state VLINE);
   }
 }
 void mSetSubs(int state){
 #ifdef DBGSYNC
   if(ti->fo) {
-    fprintf(ti->fo,"MST:%3.2d %3.2d %3.2d...",md.nstep,md.state,*state);
+    fprintf(ti->fo,"MST:%3.2d %3.2d %3.2d...",md.nstep,md.state,state);
     fflush(ti->fo);
   }
 #endif
@@ -375,7 +389,7 @@ void gWaitSubs(int state){//mt
   }
   fprintf(ti->fo," ... "); fflush(ti->fo);
 #endif
-  printf("[GroupMain] Group=%d, pid %d, %d %d\n", ti->igrp, ti->ind, ti->sib, ti->sie);
+  // printf("[GroupMain] Group=%d, pid %d, %d %d\n", ti->igrp, ti->ind, ti->sib, ti->sie);
   for(int i= ti->sib;i<ti->sie;i++){
     Wait_LGE(PSSTATE(i),state,__LINE__);
   }
@@ -442,7 +456,7 @@ void gSetMain(int state){
   md.gstate[(ti->igrp)*MSB]=state;
 #ifdef DBGSYNC
   if(ti->fo) {
-    printf(ti->fo,"gsm:%3.2d %3.2d %3.2d %3.2d end\n",md.nstep,md.gstate[(ti->igrp)*MSB],state,ti->igrp);
+    fprintf(ti->fo,"gsm:%3.2d %3.2d %3.2d %3.2d end\n",md.nstep,md.gstate[(ti->igrp)*MSB],state,ti->igrp);
     fflush(ti->fo);
   }
 #endif
@@ -454,7 +468,7 @@ void mWaitGrps(int state){//mmt
   if(ti->fo) {
     fprintf(ti->fo,"MWG:%d %d %d:",md.nstep,state,md.ngrp);
     for(int i=0;i<md.ngrp;i++){ fprintf(ti->fo,"%d ",md.gstate[(i)*MSB]); }
-    fprintf("\n ");
+    fprintf(ti->fo,"\n ");
     fflush(ti->fo);
   }
 #endif
@@ -497,6 +511,7 @@ void swaitstater_(int *state){ sWaitStater(*state); }
 void ssetstate_  (int *state){ sSetState  (*state);   }
 //MS
 void mwaitsubs_  (int *state)    { mWaitSubs (*state);}
+void mwaitsubsr_ (int *state)    { mWaitSubsr(*state);}
 void msetsubs_  (int *state)    { mSetSubs (*state);}
 
 //GS
@@ -558,7 +573,7 @@ void prtsc(const char*tag){
   for(int i=0;i<16;i++){
     sprintf(buf+i*10,"|%9.5f     Z",ti->tscds[i]*(1./(100*1000*1000)));
   }
-  fprintf(ti->fo,"%2s(s):%2.2d %2.2d %2d:%s\n",tag,md.mpi_id,ti->igrp,ti->ind,buf);
+  fprintf(ti->fo,"%2s(s):%2.2d %2.2d %2d:%s\n",tag,mpi_id,ti->igrp,ti->ind,buf);
   fflush(ti->fo);
 }
 void prtsc_(){
@@ -579,8 +594,7 @@ static void ClearThread(HTHREADINFO pti){
     
     //printf("mpi_id:%d threadid:%d ind:%d end stage16\n",mpi_id,pti->threadid,pti->ind);
     if(ThreadG){
-
-      gi->sstate[pti->ind*MSBG]=0;
+      pti->pg->sstate[pti->ind*MSBG]=0;
     }
     //printf("mpi_id:%d threadid:%d indg:%d end stage15\n",mpi_id,pti->threadid,pti->indg);
 
@@ -726,7 +740,6 @@ void initmd(){
       int nsize=_gettdsize_();
       if(nsize){
         //printf("nsize:%d\n",nsize);
-        void *ss=hmalloc(nsize);
         pti->td=hmalloc(nsize);
       }
       pti->ind=j;
@@ -811,7 +824,7 @@ void zStartThreads(TFunc tfun,void*para,int detach,int clear){
         threadGroup *pgi=md.grps[i];
         tis=pgi->threads;
         for(j=0;j<pgi->Nthreads;j++){
-          ClearThread(tis+i);
+          ClearThread(tis+j);
         }
       }
     }else{

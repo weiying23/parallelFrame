@@ -8,8 +8,8 @@
 | `InitThreads` | `int mpi_id_, NCorePClu_, NCluPNode_, NCorePGrp_, NThPGrp_, NGrpPProc_, NProcPNode_, int *ManageCoreId_` | `int` | 初始化线程系统，配置线程参数 |
 | `StartThreads` | `TFunc tfun` | `void` | 启动所有工作线程，执行指定函数 |
 | `EndThreads` | `void` | `void` | 结束所有工作线程 |
-| `setthread` | `int NCorePClu_, NThPClu_, NGrpPProc_, NProcPNode_, ManageCoreId_` | `void` | 设置线程配置参数 |
-| `initthreads_` | `int *mpi_id_, *NCorePClu_, *NCluPNode_, *NCorePProc_, *NThPGrp_, *NGrpPProc_, *NProcPNode_, *ManageCoreId_, *err` | `void` | Fortran接口：初始化线程 |
+| `setthread` | `int NCorePClu_, NThPGrp_, NGrpPProc_, NProcPNode_, ManageCoreId_` | `void` | 设置全局线程配置参数 |
+| `initthreads_` | `int *mpi_id_, *NCorePClu_, *NCluPNode_, *NCorePGrp_, *NThPGrp_, *NGrpPProc_, *NProcPNode_, *ManageCoreId_, *err` | `void` | Fortran接口：初始化线程 |
 | `startthreads_` | `void` | `void` | Fortran接口：启动线程 |
 | `endthreads_` | `void` | `void` | Fortran接口：结束线程 |
 | `bindthread` | `void` | `void` | 绑定当前线程到指定CPU核心 |
@@ -23,9 +23,7 @@
 | 函数名 | 参数 | 返回值 | 说明 |
 |--------|------|--------|------|
 | `gettid` | `void` | `int` | 获取当前线程索引 |
-| `gettid_` | `void` | `int` | Fortran接口：获取线程索引 |
 | `getnt` | `void` | `int` | 获取当前组线程总数 |
-| `getnt_` | `void` | `int` | Fortran接口：获取线程总数 |
 | `_threadmain_` | `HTHREADINFO ti` | `void` | 线程主函数入口 |
 
 ---
@@ -95,15 +93,6 @@
 #define MWGR  mWaitGrpsr(RFB)   // 主线程等待所有组（反向）
 ```
 
-### 3.4 通用同步
-
-| 函数名 | 参数 | 说明 |
-|--------|------|------|
-| `MultiThreadSync` | `void` | 多线程同步屏障 |
-| `multithreadsync_` | `void` | Fortran接口：多线程同步 |
-
----
-
 ## 4. 性能计时函数 (TSC)
 
 | 函数名 | 参数 | 说明 |
@@ -148,8 +137,8 @@
 
 | 函数名 | 参数 | 返回值 | 说明 |
 |--------|------|--------|------|
-| `SetLocV` | `int typ, int ind, void* p` | `void` | 设置本地变量指针 |
-| `GetLocV` | `int typ, int ind, void* p` | `void*` | 获取本地变量指针 |
+| `SetLocV` | `int typ, int ind, void* p` | `void` | 设置局部指针槽位，`typ=0/1/2` 分别表示线程/线程组/全局 |
+| `GetLocV` | `int typ, int ind, void* p` | `void*` | 获取局部指针槽位，`typ=0/1/2` 分别表示线程/线程组/全局 |
 | `ntdelay` | `int n` | `void` | 纳秒级延迟 |
 | `ntdelay_` | `int n` | `void` | Fortran接口：延迟 |
 | `opentf` | `void` | `void` | 打开调试日志文件 |
@@ -171,7 +160,7 @@
 | `NThPGrp` | `int` | 每组线程数 |
 | `NProcPNode` | `int` | 每节点进程数 |
 | `ManageCoreId` | `int` | 管理核心ID |
-| `NThreads` | `int` | 总线程数 |
+| `NThreads` | `int` | 当前进程总线程数（含主线程） |
 | `ThreadG` | `int` | 分组标志 |
 
 ---
@@ -193,8 +182,11 @@
 // 初始化线程系统
 InitThreads(0, 38, 16, 38, 8, 4, 16, &manageId);
 
-// 启动线程执行计算函数
+// 启动工作线程
 StartThreads(my_compute_function);
+
+// 当前主线程不会被 StartThreads 自动执行，需要自行进入线程入口
+my_compute_function();
 
 // 在线程函数中使用同步
 void my_compute_function() {

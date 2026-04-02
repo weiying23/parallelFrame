@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 // 定义 C++ 兼容的宏
 #ifdef __cplusplus
@@ -108,17 +109,20 @@ int gettid(void);
 int getnt(void);
 int GetVInt(int volatile *volatile p);
 //tread ctrl 
-void setthread(int NCorePClu_ ,int NThPClu_,int NGrpPProc_,int NProcPNode_,int ManageCoreId_);
-int InitThreads(int mpi_id_,int NCorePClu_ ,int NCluPNode_,int NCorePProc_,int NThPGrp_,int NGrpPProc_,int NProcPNode_,int *ManageCoreId_);
+void setthread(int NCorePClu_ ,int NThPGrp_,int NGrpPProc_,int NProcPNode_,int ManageCoreId_);
+int InitThreads(int mpi_id_,int NCorePClu_ ,int NCluPNode_,int NCorePGrp_,int NThPGrp_,int NGrpPProc_,int NProcPNode_,int *ManageCoreId_);
 void StartThreads(TFunc tfun);
 void EndThreads();
-void inithreads_(int *mpi_id_,int *NCorePClu_ ,int *NCluPNode_,int *NCorePProc_,int *NThPGrp_,int *NGrpPProc_,int *NProcPNode_,int *ManageCoreId_,int *err);
+void inithreads_(int *mpi_id_,int *NCorePClu_ ,int *NCluPNode_,int *NCorePGrp_,int *NThPGrp_,int *NGrpPProc_,int *NProcPNode_,int *ManageCoreId_,int *err);
 void startthreads_();
 void endthreads_();
 void bindthread();
 void bindthread_();
 int bindcpu(int id);
+void SetLocV(int typ,int ind,void *p);
+void *GetLocV(int typ,int ind,void *p);
 void opentf();
+void ntdelay(int n);
 void ntdelay_(int n);
 
 void tscinit();
@@ -126,6 +130,10 @@ void tscb(int id);
 void tsce(int id);
 void tsceb(int id);
 void prtsc(const char*tag);
+void tscb_(int *id_);
+void tsce_(int *id_);
+void tsceb_(int *id_);
+void prtsc_();
 
 // Fortran 接口使用的默认线程函数（可覆盖）
 void thread_run(void);
@@ -173,6 +181,9 @@ void gsetmain_   (int *state);
 void mwaitsubs_  (int *state);
 void mwaitsubsr_ (int *state);
 void msetsubs_   (int *state);
+void swaitstate_ (int *state);
+void swaitstater_(int *state);
+void ssetstate_  (int *state);
 //MG
 void mwaitgrps_ (int *state);
 void mwaitgrpsr_(int *state);

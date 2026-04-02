@@ -1,7 +1,8 @@
 # Makefile for mythread examples
 
 CC = mpicc
-CFLAGS = -Wall -g -O2 -I.
+# CFLAGS = -Wall -g -O2 -I.
+CFLAGS = -g -O2 -I.
 LDFLAGS = -lpthread -lm
 
 # 目标文件
