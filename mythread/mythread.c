@@ -68,13 +68,12 @@ void endthreads_(){
 }
 void initdatasize(int tsize,int gsize){
 }
-int GetVInt(int volatile *volatile p){
-    return *p;
-}
-int _getgdsize_(){
+
+// 弱符号定义：用户代码可以覆盖
+__attribute__((weak)) int _getgdsize_(){
   return sizeof(float);
 }
-int _gettdsize_(){
+__attribute__((weak)) int _gettdsize_(){
   return sizeof(float);
 }
 
@@ -235,7 +234,9 @@ void ntdelay_(int n){
 #define FWAIT(NM,COP) int Wait_##NM(volatile int *pv,int cv PLINE){ \
   for(int i=0;GetVInt(pv) COP cv;i++){ \
   if(i>=MAXCHECK){ printf("wait state timeout %d %s %d\n",*pv,#COP,cv);exit(0); }\
-  ntdelay(1); } return 0;\
+  ntdelay(1); } \
+  /* printf("Group=%d, Thread=%d: wait func runed!, %d %s %d \n", ti->igrp, ti->ind, GetVInt(pv), #COP, cv); */ \
+  return 0;\
 }
 FWAIT(LNE,==);
 FWAIT(LEQ,!=);
@@ -374,6 +375,7 @@ void gWaitSubs(int state){//mt
   }
   fprintf(ti->fo," ... "); fflush(ti->fo);
 #endif
+  printf("[GroupMain] Group=%d, pid %d, %d %d\n", ti->igrp, ti->ind, ti->sib, ti->sie);
   for(int i= ti->sib;i<ti->sie;i++){
     Wait_LGE(PSSTATE(i),state,__LINE__);
   }
@@ -678,7 +680,7 @@ void initmd(){
         pti->pg=pgi;
         pti->threads=pgi->threads;
         //printf("pti->ind:%d \n",j);
-        pti->ind=j+1;
+        pti->ind=j;
         pti->sync_flag = sync_flag_init;
         pti->Nthreads=pgi->Nthreads;
         //printf("Nthread1:%d\n",pgi->Nthreads);
@@ -727,7 +729,7 @@ void initmd(){
         void *ss=hmalloc(nsize);
         pti->td=hmalloc(nsize);
       }
-      pti->ind=j + 1;
+      pti->ind=j;
       pti->sync_flag = sync_flag_init;
       
       pti->indg=cbase+j+1;

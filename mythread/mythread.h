@@ -106,7 +106,7 @@ void  thread_run();
 // 线程信息获取
 int gettid(void);
 int getnt(void);
-
+int GetVInt(int volatile *volatile p);
 //tread ctrl 
 void setthread(int NCorePClu_ ,int NThPClu_,int NGrpPProc_,int NProcPNode_,int ManageCoreId_);
 int InitThreads(int mpi_id_,int NCorePClu_ ,int NCluPNode_,int NCorePProc_,int NThPGrp_,int NGrpPProc_,int NProcPNode_,int *ManageCoreId_);

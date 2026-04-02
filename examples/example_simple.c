@@ -13,14 +13,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <mpi.h>
+#include <unistd.h>
 #include "mythread/mythread.h"
 
 #define N_GROUPS 4
 #define N_THREADS_PER_GROUP 5
 
 // 线程数据大小函数（必需）
-// int _gettdsize_() { return 64; }
-// int _getgdsize_() { return 64; }
+int _gettdsize_() { return 64; }
+int _getgdsize_() { return 64; }
+
+int GetVInt(int volatile *volatile p){
+    int tid = ti->ind;
+    int gid = ti->igrp;
+    // printf("Group=%d, Thread=%d: get func runed!\n", gid, tid);
+    return *p;
+}
 
 // 全局计数器
 static volatile int work_counter = 0;
@@ -29,27 +37,28 @@ static volatile int work_counter = 0;
  * 工作线程函数
  */
 void do_work() {
-    int tid = gettid();
+    int tid = ti->ind;
     int gid = ti->igrp;
+    int s = 1;
     
     printf("  [Worker] MPI=%d, Group=%d, Thread=%d: waiting for work...\n", 
            mpi_id, gid, tid);
     
     // 等待组主线程信号 (SubThread wait GroupMain)
-    SWG;
-    
+    sWaitGrp(s);
+
     // 执行工作
     work_counter++;
     printf("  [Worker] MPI=%d, Group=%d, Thread=%d: working (counter=%d)\n", 
            mpi_id, gid, tid, work_counter);
-    
+    sleep(10);
     // 模拟计算
     for (int i = 0; i < 1000000; i++) {
         work_counter += (i % 2 == 0) ? 1 : -1;
     }
     
     // 通知组主线程完成 (SubThread Set Group)
-    SSG;
+    sSetGrp(s);
     
     printf("  [Worker] MPI=%d, Group=%d, Thread=%d: work done\n", 
            mpi_id, gid, tid);
@@ -60,46 +69,54 @@ void do_work() {
  */
 void group_main() {
     int gid = ti->igrp;
-    
+    int s = 1;
     printf("[GroupMain] MPI=%d, Group=%d: started\n", mpi_id, gid);
     
     // 等待主线程信号
-    GWM;
+    gWaitMain(s);
     
     printf("[GroupMain] MPI=%d, Group=%d: got signal from main, assigning work\n", 
            mpi_id, gid);
     
     // 通知子线程开始工作
-    GSS;
-    
+    gSetSubs(s);
+
+    gWaitSubs(s);
+    // sleep(2);
     // 等待所有子线程完成
-    GWS;
     
     printf("[GroupMain] MPI=%d, Group=%d: all workers done\n", mpi_id, gid);
     
     // 通知主线程本组完成
-    GSM;
+    gSetMain(s);
+
+    s++;
+    sleep(4);
+    gWaitMain(s);
+    gSetMain(s);
 }
 
 /**
  * 主线程（管理所有组）
  */
 void main_thread() {
+    int s = 1;
     printf("[Main] MPI=%d: main thread started\n", mpi_id);
     
     // 第一轮：通知所有组开始工作
     printf("[Main] MPI=%d: signaling all groups to start...\n", mpi_id);
-    MSG;  // Main Set Groups
+    mSetGrps(s);  // Main Set Groups
     
     // 等待所有组完成
-    MWG;  // Main Wait Groups
+    mWaitGrps(s);  // Main Wait Groups
     printf("[Main] MPI=%d: all groups completed\n", mpi_id);
     
+    s++;
     // 第二轮：重复
     printf("[Main] MPI=%d: starting second round...\n", mpi_id);
-    MSS;  // Main Set Subs (用于下一轮)
-    MSG;
-    MWG;
+    // MSS;  // Main Set Subs (用于下一轮)
+    mSetGrps(s);
+    mWaitGrps(s);
     
     printf("[Main] MPI=%d: second round completed\n", mpi_id);
 }
@@ -110,14 +127,12 @@ void main_thread() {
 void thread_run() {
     int tid = gettid();
     
-    // printf("thread info, tid=%d\n", tid);
-    if (tid == 0) {
+    printf("[INFO] thread info, gid=%d, tid=%d\n", ti->igrp, ti->ind);
+    if (ti->igrp == -1) {
         // 主线程
-        if (ti->igrp > 0) {
-            group_main();
-        } else {
-            main_thread();
-        }
+        main_thread();
+    } else if (ti->ind == 0){
+        group_main();
     } else {
         // 工作线程
         do_work();

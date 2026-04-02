@@ -1,14 +1,14 @@
 # Makefile for mythread examples
 
 CC = mpicc
-CFLAGS = -Wall -O2 -I..
+CFLAGS = -Wall -g -O2 -I.. -I.
 LDFLAGS = -lpthread -lm
 
 # 目标文件
 TARGETS = example_simple example_mpi_mythread
 
 # 源文件
-MYTHREAD_SRC = mythread/mythread.c
+MYTHREAD_SRC = ../mythread/mythread.c
 
 .PHONY: all clean
 
