@@ -18,9 +18,9 @@
  * 线程只负责计算不重叠的 tile，不再做线程级 ghost 交换。
  */
 
-#define NX 4096
-#define NY 4096
-#define NT 400
+#define NX 32000
+#define NY 32000
+#define NT 800
 
 #define DT 0.001
 #define C0 0.1
@@ -30,7 +30,7 @@
  * 1. USE_FIXED_DOMAIN=1：固定物理区域，增大 NX/NY 表示网格加密、分辨率提高。
  * 2. USE_FIXED_DOMAIN=0：固定 DX/DY，增大 NX/NY 表示物理区域扩大、总网格点增加。
  */
-#define USE_FIXED_DOMAIN 1
+#define USE_FIXED_DOMAIN 0
 
 #if USE_FIXED_DOMAIN
 #define LX 1.0
@@ -46,8 +46,9 @@
 
 #define HALO 1
 #define N_GROUPS 4
-#define N_WORKERS 8
+#define N_WORKERS 35
 #define THREADS_PER_GROUP (N_WORKERS + 1)
+#define ENERGY_REPORT_INTERVAL 100
 
 #define DT2 (DT * DT)
 #define CFL_X (C0 * DT / DX)
@@ -75,6 +76,7 @@ typedef struct {
   int x_end;
   int y_begin;
   int y_end;
+  double partial_energy;
 } ThreadTask;
 
 static SimulationData g_sim = {0};
@@ -82,6 +84,7 @@ static double *g_send_up = NULL;
 static double *g_recv_up = NULL;
 static double *g_send_down = NULL;
 static double *g_recv_down = NULL;
+static double *g_group_energy = NULL;
 
 int _gettdsize_() {
   return (int)sizeof(ThreadTask);
@@ -108,6 +111,32 @@ static void split_range(int begin,int end,int parts,int index,int *sub_begin,int
 
   *sub_begin = begin + offset;
   *sub_end = *sub_begin + base + extra;
+}
+
+static int initial_energy_state(void) {
+  return 1;
+}
+
+static int compute_phase_state(int step) {
+  return 3 * step + 2;
+}
+
+static int boundary_phase_state(int step) {
+  return 3 * step + 3;
+}
+
+static int energy_phase_state(int step) {
+  return 3 * step + 4;
+}
+
+static int should_measure_energy_step(int step) {
+  if (step == 0 || step == NT - 1) {
+    return 1;
+  }
+  if (ENERGY_REPORT_INTERVAL > 0 && ((step + 1) % ENERGY_REPORT_INTERVAL) == 0) {
+    return 1;
+  }
+  return 0;
 }
 
 static void *xcalloc(size_t count,size_t size) {
@@ -189,6 +218,11 @@ static void free_simulation(void) {
   g_recv_down = NULL;
 }
 
+static void free_group_energy(void) {
+  free(g_group_energy);
+  g_group_energy = NULL;
+}
+
 static void enforce_dirichlet_boundaries(double *field) {
   for (int y = 0; y < g_sim.local_ny + 2 * HALO; y++) {
     field[idx(y, 0)] = 0.0;
@@ -246,12 +280,54 @@ static void exchange_y_halos_for(double *field) {
   zero_physical_y_boundaries(field);
 }
 
-static void exchange_y_halos(void) {
-  exchange_y_halos_for(g_sim.u_curr);
+static void begin_y_halo_exchange_for(double *field,MPI_Request requests[4],int *request_count) {
+  int count = 0;
+
+  enforce_dirichlet_boundaries(field);
+  zero_physical_y_boundaries(field);
+
+  if (g_sim.neighbor_up >= 0) {
+    memcpy(g_send_up, &field[idx(g_sim.local_ny, 0)], (size_t)NX * sizeof(double));
+    MPI_Irecv(g_recv_up, NX, MPI_DOUBLE, g_sim.neighbor_up, 101, MPI_COMM_WORLD, &requests[count++]);
+    MPI_Isend(g_send_up, NX, MPI_DOUBLE, g_sim.neighbor_up, 100, MPI_COMM_WORLD, &requests[count++]);
+  } else {
+    memset(&field[idx(g_sim.local_ny + HALO, 0)], 0, (size_t)NX * sizeof(double));
+  }
+
+  if (g_sim.neighbor_down >= 0) {
+    memcpy(g_send_down, &field[idx(HALO, 0)], (size_t)NX * sizeof(double));
+    MPI_Irecv(g_recv_down, NX, MPI_DOUBLE, g_sim.neighbor_down, 100, MPI_COMM_WORLD, &requests[count++]);
+    MPI_Isend(g_send_down, NX, MPI_DOUBLE, g_sim.neighbor_down, 101, MPI_COMM_WORLD, &requests[count++]);
+  } else {
+    memset(&field[idx(0, 0)], 0, (size_t)NX * sizeof(double));
+  }
+
+  *request_count = count;
 }
 
-static void compute_block(ThreadTask *task) {
-  for (int y = task->y_begin; y < task->y_end; y++) {
+static void end_y_halo_exchange_for(double *field,MPI_Request requests[4],int request_count) {
+  if (request_count > 0) {
+    MPI_Waitall(request_count, requests, MPI_STATUSES_IGNORE);
+  }
+
+  if (g_sim.neighbor_up >= 0) {
+    memcpy(&field[idx(g_sim.local_ny + HALO, 0)], g_recv_up, (size_t)NX * sizeof(double));
+  } else {
+    memset(&field[idx(g_sim.local_ny + HALO, 0)], 0, (size_t)NX * sizeof(double));
+  }
+
+  if (g_sim.neighbor_down >= 0) {
+    memcpy(&field[idx(0, 0)], g_recv_down, (size_t)NX * sizeof(double));
+  } else {
+    memset(&field[idx(0, 0)], 0, (size_t)NX * sizeof(double));
+  }
+
+  enforce_dirichlet_boundaries(field);
+  zero_physical_y_boundaries(field);
+}
+
+static void compute_block_rows(const ThreadTask *task,int y_begin,int y_end) {
+  for (int y = y_begin; y < y_end; y++) {
     int global_y = global_y_from_local(y);
 
     if (global_y == 0 || global_y == NY - 1) {
@@ -268,34 +344,69 @@ static void compute_block(ThreadTask *task) {
   }
 }
 
-static double compute_total_energy_local(void) {
+static void compute_interior_block(const ThreadTask *task) {
+  int y_begin = task->y_begin;
+  int y_end = task->y_end;
+
+  if (g_sim.neighbor_down >= 0 && y_begin < HALO + 1) {
+    y_begin = HALO + 1;
+  }
+  if (g_sim.neighbor_up >= 0 && y_end > g_sim.local_ny) {
+    y_end = g_sim.local_ny;
+  }
+  if (y_begin < y_end) {
+    compute_block_rows(task, y_begin, y_end);
+  }
+}
+
+static void compute_boundary_block(const ThreadTask *task) {
+  int lower_row = HALO;
+  int upper_row = g_sim.local_ny;
+
+  if (g_sim.neighbor_down >= 0 && task->y_begin <= lower_row && lower_row < task->y_end) {
+    compute_block_rows(task, lower_row, lower_row + 1);
+  }
+  if (g_sim.neighbor_up >= 0 &&
+      upper_row != lower_row &&
+      task->y_begin <= upper_row &&
+      upper_row < task->y_end) {
+    compute_block_rows(task, upper_row, upper_row + 1);
+  }
+}
+
+static double compute_energy_block(const ThreadTask *task) {
   double kinetic = 0.0;
   double potential_x = 0.0;
   double potential_y = 0.0;
   double cell_area = DX * DY;
+  int x_edge_begin;
+  int x_edge_end;
 
-  for (int y = HALO; y < g_sim.local_ny + HALO; y++) {
+  if (task->x_begin >= task->x_end || task->y_begin >= task->y_end) {
+    return 0.0;
+  }
+
+  x_edge_begin = (task->x_begin == 1) ? 0 : task->x_begin;
+  x_edge_end = task->x_end;
+
+  for (int y = task->y_begin; y < task->y_end; y++) {
     int global_y = global_y_from_local(y);
 
-    for (int x = 1; x < NX - 1; x++) {
-      double ut;
-
-      if (global_y == 0 || global_y == NY - 1) {
-        continue;
+    if (global_y > 0 && global_y < NY - 1) {
+      for (int x = task->x_begin; x < task->x_end; x++) {
+        double ut = (g_sim.u_curr[idx(y, x)] - g_sim.u_prev[idx(y, x)]) / DT;
+        kinetic += ut * ut;
       }
-
-      ut = (g_sim.u_curr[idx(y, x)] - g_sim.u_prev[idx(y, x)]) / DT;
-      kinetic += ut * ut;
     }
 
-    for (int x = 0; x < NX - 1; x++) {
+    for (int x = x_edge_begin; x < x_edge_end; x++) {
       double du_curr = (g_sim.u_curr[idx(y, x + 1)] - g_sim.u_curr[idx(y, x)]) / DX;
       double du_prev = (g_sim.u_prev[idx(y, x + 1)] - g_sim.u_prev[idx(y, x)]) / DX;
       potential_x += du_curr * du_prev;
     }
 
     if (global_y < NY - 1) {
-      for (int x = 1; x < NX - 1; x++) {
+      for (int x = task->x_begin; x < task->x_end; x++) {
         double du_curr = (g_sim.u_curr[idx(y + 1, x)] - g_sim.u_curr[idx(y, x)]) / DY;
         double du_prev = (g_sim.u_prev[idx(y + 1, x)] - g_sim.u_prev[idx(y, x)]) / DY;
         potential_y += du_curr * du_prev;
@@ -304,6 +415,28 @@ static double compute_total_energy_local(void) {
   }
 
   return 0.5 * (kinetic + C0 * C0 * (potential_x + potential_y)) * cell_area;
+}
+
+static double accumulate_worker_energy(void) {
+  double local_energy = 0.0;
+
+  for (int g = 0; g < md.ngrp; g++) {
+    local_energy += g_group_energy[g];
+  }
+
+  return local_energy;
+}
+
+static double reduce_group_worker_energy(int group_id) {
+  double energy = 0.0;
+  threadGroup *pg = md.grps[group_id];
+
+  for (int t = 1; t < pg->Nthreads; t++) {
+    ThreadTask *task = (ThreadTask*)pg->threads[t].td;
+    energy += task->partial_energy;
+  }
+
+  return energy;
 }
 
 static void swap_fields(void) {
@@ -316,6 +449,7 @@ static void swap_fields(void) {
 static void setup_thread_tasks(void) {
   for (int g = 0; g < md.ngrp; g++) {
     threadGroup *pg = md.grps[g];
+    int worker_count = pg->Nthreads - 1;
     int y_begin, y_end;
 
     split_range(HALO, g_sim.local_ny + HALO, md.ngrp, g, &y_begin, &y_end);
@@ -325,7 +459,12 @@ static void setup_thread_tasks(void) {
       ThreadTask *task = (ThreadTask*)pti->td;
       int x_begin, x_end;
 
-      split_range(1, NX - 1, pg->Nthreads, t, &x_begin, &x_end);
+      if (t == 0 || worker_count <= 0) {
+        x_begin = 1;
+        x_end = 1;
+      } else {
+        split_range(1, NX - 1, worker_count, t - 1, &x_begin, &x_end);
+      }
 
       task->gid = g;
       task->tid = t;
@@ -333,12 +472,14 @@ static void setup_thread_tasks(void) {
       task->x_end = x_end;
       task->y_begin = y_begin;
       task->y_end = y_end;
+      task->partial_energy = 0.0;
 
       printf(
-        "[Init] MPI=%d Group=%d Thread=%d global-y=[%d,%d) x=[%d,%d)\n",
+        "[Init] MPI=%d Group=%d Thread=%d role=%s global-y=[%d,%d) x=[%d,%d)\n",
         mpi_id,
         g,
         t,
+        (t == 0) ? "group-main" : "worker",
         g_sim.local_y_begin + (y_begin - HALO),
         g_sim.local_y_begin + (y_end - HALO),
         x_begin,
@@ -351,26 +492,60 @@ static void setup_thread_tasks(void) {
 static void worker_thread(void) {
   ThreadTask *task = (ThreadTask*)ti->td;
 
-  for (int step = 0; step < NT; step++) {
-    int state = step + 1;
+  sWaitGrp(initial_energy_state());
+  task->partial_energy = compute_energy_block(task);
+  sSetGrp(initial_energy_state());
 
-    sWaitGrp(state);
-    compute_block(task);
-    sSetGrp(state);
+  for (int step = 0; step < NT; step++) {
+    int compute_state = compute_phase_state(step);
+    int boundary_state = boundary_phase_state(step);
+    int energy_state = energy_phase_state(step);
+
+    sWaitGrp(compute_state);
+    compute_interior_block(task);
+    sSetGrp(compute_state);
+
+    sWaitGrp(boundary_state);
+    compute_boundary_block(task);
+    sSetGrp(boundary_state);
+
+    if (should_measure_energy_step(step)) {
+      sWaitGrp(energy_state);
+      task->partial_energy = compute_energy_block(task);
+      sSetGrp(energy_state);
+    }
   }
 }
 
 static void group_main_thread(void) {
-  ThreadTask *task = (ThreadTask*)ti->td;
+  gWaitMain(initial_energy_state());
+  gSetSubs(initial_energy_state());
+  gWaitSubs(initial_energy_state());
+  g_group_energy[ti->igrp] = reduce_group_worker_energy(ti->igrp);
+  gSetMain(initial_energy_state());
 
   for (int step = 0; step < NT; step++) {
-    int state = step + 1;
+    int compute_state = compute_phase_state(step);
+    int boundary_state = boundary_phase_state(step);
+    int energy_state = energy_phase_state(step);
 
-    gWaitMain(state);
-    gSetSubs(state);
-    compute_block(task);
-    gWaitSubs(state);
-    gSetMain(state);
+    gWaitMain(compute_state);
+    gSetSubs(compute_state);
+    gWaitSubs(compute_state);
+    gSetMain(compute_state);
+
+    gWaitMain(boundary_state);
+    gSetSubs(boundary_state);
+    gWaitSubs(boundary_state);
+    gSetMain(boundary_state);
+
+    if (should_measure_energy_step(step)) {
+      gWaitMain(energy_state);
+      gSetSubs(energy_state);
+      gWaitSubs(energy_state);
+      g_group_energy[ti->igrp] = reduce_group_worker_energy(ti->igrp);
+      gSetMain(energy_state);
+    }
   }
 }
 
@@ -378,10 +553,14 @@ static void main_thread(void) {
   double start_time;
   double local_energy = 0.0;
   double global_energy = 0.0;
+  int current_halo_ready = 1;
 
   exchange_y_halos_for(g_sim.u_curr);
   exchange_y_halos_for(g_sim.u_prev);
-  local_energy = compute_total_energy_local();
+
+  mSetGrps(initial_energy_state());
+  mWaitGrps(initial_energy_state());
+  local_energy = accumulate_worker_energy();
   MPI_Allreduce(&local_energy, &global_energy, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
   g_sim.initial_energy = global_energy;
 
@@ -392,31 +571,54 @@ static void main_thread(void) {
   start_time = MPI_Wtime();
 
   for (int step = 0; step < NT; step++) {
-    int state = step + 1;
-    size_t plane_size = (size_t)(g_sim.local_ny + 2 * HALO) * (size_t)NX;
+    int compute_state = compute_phase_state(step);
+    int boundary_state = boundary_phase_state(step);
+    int energy_state = energy_phase_state(step);
+    int need_energy = should_measure_energy_step(step);
+    MPI_Request requests[4];
+    int request_count = 0;
 
-    memset(g_sim.u_next, 0, plane_size * sizeof(double));
+    if (!current_halo_ready) {
+      begin_y_halo_exchange_for(g_sim.u_curr, requests, &request_count);
+    }
 
-    mSetGrps(state);
-    mWaitGrps(state);
+    mSetGrps(compute_state);
+    mWaitGrps(compute_state);
+
+    if (!current_halo_ready) {
+      end_y_halo_exchange_for(g_sim.u_curr, requests, request_count);
+      current_halo_ready = 1;
+    }
+
+    mSetGrps(boundary_state);
+    mWaitGrps(boundary_state);
 
     swap_fields();
-    exchange_y_halos();
-    local_energy = compute_total_energy_local();
-    MPI_Allreduce(&local_energy, &global_energy, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    current_halo_ready = 0;
 
-    if (mpi_id == 0 && (step == 0 || (step + 1) % 100 == 0 || step == NT - 1)) {
-      double rel_diff = (g_sim.initial_energy > 0.0)
-        ? fabs(global_energy - g_sim.initial_energy) / g_sim.initial_energy
-        : 0.0;
+    if (need_energy) {
+      begin_y_halo_exchange_for(g_sim.u_curr, requests, &request_count);
+      end_y_halo_exchange_for(g_sim.u_curr, requests, request_count);
+      current_halo_ready = 1;
 
-      printf(
-        "[Main] Step %4d/%d  Energy=%.6f  RelDiff=%.3e\n",
-        step + 1,
-        NT,
-        global_energy,
-        rel_diff
-      );
+      mSetGrps(energy_state);
+      mWaitGrps(energy_state);
+      local_energy = accumulate_worker_energy();
+      MPI_Allreduce(&local_energy, &global_energy, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
+      if (mpi_id == 0) {
+        double rel_diff = (g_sim.initial_energy > 0.0)
+          ? fabs(global_energy - g_sim.initial_energy) / g_sim.initial_energy
+          : 0.0;
+
+        printf(
+          "[Main] Step %4d/%d  Energy=%.6f  RelDiff=%.3e\n",
+          step + 1,
+          NT,
+          global_energy,
+          rel_diff
+        );
+      }
     }
   }
 
@@ -493,6 +695,7 @@ int main(int argc,char **argv) {
     printf("CFL numbers          : c*dt/dx=%.4f  c*dt/dy=%.4f\n", CFL_X, CFL_Y);
     printf("Resolution mode      : %s\n", USE_FIXED_DOMAIN ? "fixed domain" : "fixed spacing");
     printf("Local decomposition  : MPI(Y) + Group(Y) + Thread(X)\n");
+    printf("Energy diagnostics   : initial + every %d steps + final\n", ENERGY_REPORT_INTERVAL);
     printf("============================================\n");
   }
 
@@ -516,11 +719,13 @@ int main(int argc,char **argv) {
   }
 
   setup_thread_tasks();
+  g_group_energy = (double*)xcalloc((size_t)md.ngrp, sizeof(double));
 
   StartThreads(thread_run);
   thread_run();
   EndThreads();
 
+  free_group_energy();
   free_simulation();
   MPI_Finalize();
   return 0;
