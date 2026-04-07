@@ -36,6 +36,21 @@ int GetVInt(int volatile *volatile p){
   return *p;
 }
 
+int getcpuid(){
+  cpu_set_t mask;  //CPU核的集合
+  CPU_ZERO(&mask);    //置空
+  if (sched_getaffinity(0, sizeof(mask), &mask) == -1){//设置线程CPU亲和力
+    printf("warning: could not get CPU affinity , continuing...\n");
+    return -1;
+  }
+  for(int i=0;i<CPU_SETSIZE;i++){
+    if(CPU_ISSET(i,&mask)){
+      return i;
+    }
+  }
+  return 0;
+}
+
 void initthreads_(int *mpi_id_,int *NCorePClu_ ,int *NCluPNode_,int *NCorePGrp_,int *NThPGrp_,int *NGrpPProc_,int *NProcPNode_,int *ManageCoreId_,int *err){
   *err=InitThreads(*mpi_id_,*NCorePClu_,* NCluPNode_,* NCorePGrp_,*NThPGrp_,*NGrpPProc_,*NProcPNode_,ManageCoreId_);
 }

@@ -45,7 +45,7 @@
 #endif
 
 #define HALO 1
-#define N_GROUPS 2
+#define N_GROUPS 4
 #define N_WORKERS 8
 #define THREADS_PER_GROUP (N_WORKERS + 1)
 
@@ -429,6 +429,8 @@ static void main_thread(void) {
 }
 
 void thread_run(void) {
+  printf("[info] mpi %d gid %d, pid %d, c %d, getcore %d\n", mpi_id, ti->igrp,
+    ti->ind, ti->indg, getcpuid());
   if (ti->igrp < 0) {
     main_thread();
   } else if (ti->ind == 0) {
@@ -442,11 +444,11 @@ int main(int argc,char **argv) {
   int mpi_rank, mpi_size;
   int NCorePClu = 38;
   int NCluPNode = 16;
-  int NCorePGrp = 8;
+  int NCorePGrp = 37;
   int NThPGrp = THREADS_PER_GROUP;
   int NGrpPProc = N_GROUPS;
   int NProcPNode = 4;
-  int ManageCoreId = -2;
+  int ManageCoreId = 36;
   int err;
 
   MPI_Init(&argc, &argv);
@@ -494,7 +496,7 @@ int main(int argc,char **argv) {
     printf("============================================\n");
   }
 
-  NProcPNode = mpi_size;
+  // NProcPNode = mpi_size;
   err = InitThreads(
     mpi_rank,
     NCorePClu,

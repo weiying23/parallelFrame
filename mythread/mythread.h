@@ -35,6 +35,7 @@ typedef void (*TFunc)(void);
 typedef void (*Func)();
 typedef void* (*TSFunc)(void*);
 void initmd();
+int getcpuid();
 typedef struct _THREADINFO{
   short Nthreads,MainThread,igrp;      // 4 * 2 bytes
   short nlocv,mlocv,detach,indg,sib,sie;   // 3 * 2 bytes
