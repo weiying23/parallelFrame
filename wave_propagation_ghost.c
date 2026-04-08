@@ -46,7 +46,7 @@
 
 #define HALO 1
 #define N_GROUPS 4
-#define N_WORKERS 6
+#define N_WORKERS 35
 #define THREADS_PER_GROUP (N_WORKERS + 1)
 #define ENERGY_REPORT_INTERVAL 60
 
@@ -114,19 +114,19 @@ static void split_range(int begin,int end,int parts,int index,int *sub_begin,int
 }
 
 static int initial_energy_state(void) {
-  return 1;
+  return 2;
 }
 
 static int compute_phase_state(int step) {
-  return 3 * step + 2;
-}
-
-static int boundary_phase_state(int step) {
   return 3 * step + 3;
 }
 
-static int energy_phase_state(int step) {
+static int boundary_phase_state(int step) {
   return 3 * step + 4;
+}
+
+static int energy_phase_state(int step) {
+  return 3 * step + 5;
 }
 
 static int should_measure_energy_step(int step) {
@@ -142,6 +142,10 @@ static int should_measure_energy_step(int step) {
 /* mythread treats NGrpPProc <= 1 as plain non-group mode rather than a one-group layout. */
 static int uses_group_threads(void) {
   return ThreadG != 0;
+}
+
+static int init_fields_state(void) {
+  return 1;
 }
 
 static void start_phase_from_main(int state) {
@@ -192,27 +196,30 @@ static void setup_process_domain(int mpi_rank,int mpi_size) {
   g_sim.neighbor_up = (g_sim.local_y_end < NY) ? mpi_rank + 1 : -1;
 }
 
-static void seed_initial_condition(void) {
+static double initial_condition_value(int global_y,int x) {
   double cx = 0.5 * LX;
   double cy = 0.5 * LY;
   double sigma = 0.06 * ((LX < LY) ? LX : LY);
+  double dx = x * DX - cx;
+  double dy = global_y * DY - cy;
 
-  for (int ly = 0; ly < g_sim.local_ny; ly++) {
-    int gy = g_sim.local_y_begin + ly;
-    double y = gy * DY;
+  return exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma));
+}
 
-    if (gy == 0 || gy == NY - 1) {
-      continue;
-    }
+static void initialize_field_block(const ThreadTask *task) {
+  for (int y = task->y_begin; y < task->y_end; y++) {
+    int global_y = global_y_from_local(y);
 
-    for (int x = 1; x < NX - 1; x++) {
-      double dx = x * DX - cx;
-      double dy = y - cy;
-      double value = exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma));
-      int p = idx(ly + HALO, x);
+    for (int x = task->x_begin; x < task->x_end; x++) {
+      int p = idx(y, x);
+      double value = 0.0;
 
+      if (global_y != 0 && global_y != NY - 1) {
+        value = initial_condition_value(global_y, x);
+      }
       g_sim.u_curr[p] = value;
       g_sim.u_prev[p] = value;
+      g_sim.u_next[p] = 0.0;
     }
   }
 }
@@ -235,8 +242,6 @@ static void init_simulation(int mpi_rank,int mpi_size) {
   g_recv_up = (double*)xcalloc((size_t)NX, sizeof(double));
   g_send_down = (double*)xcalloc((size_t)NX, sizeof(double));
   g_recv_down = (double*)xcalloc((size_t)NX, sizeof(double));
-
-  seed_initial_condition();
 }
 
 static void free_simulation(void) {
@@ -581,6 +586,10 @@ static void setup_thread_tasks(void) {
 static void worker_thread(void) {
   ThreadTask *task = (ThreadTask*)ti->td;
 
+  wait_phase_from_worker(init_fields_state());
+  initialize_field_block(task);
+  finish_phase_from_worker(init_fields_state());
+
   wait_phase_from_worker(initial_energy_state());
   task->partial_energy = compute_energy_block(task);
   finish_phase_from_worker(initial_energy_state());
@@ -595,11 +604,17 @@ static void worker_thread(void) {
     double beg = MPI_Wtime();
 // #endif // DEBUG
     compute_interior_block(task);
+// #ifdef DEBUG
+    double compute_time = MPI_Wtime() - beg;
+    // double sync_beg = MPI_Wtime();
+// #endif // DEBUG
     finish_phase_from_worker(compute_state);
 // #ifdef DEBUG
-    double w_time = MPI_Wtime() - beg;
-    printf("[worker] mpi %d gid %d, pid %d, finish step %d, time %.3f\n",
-      mpi_id, ti->igrp, ti->ind, step, w_time);
+    // double sync_time = MPI_Wtime() - sync_beg;
+    printf("[worker] mpi %d gid %d, pid %d, compute step %d, time %.3f\n",
+      mpi_id, ti->igrp, ti->ind, step, compute_time);
+    // printf("[worker] mpi %d gid %d, pid %d, sync step %d, time %.3f\n",
+      // mpi_id, ti->igrp, ti->ind, step, sync_time);
 // #endif // DEBUG
     wait_phase_from_worker(boundary_state);
     compute_boundary_block(task);
@@ -614,6 +629,11 @@ static void worker_thread(void) {
 }
 
 static void group_main_thread(void) {
+  gWaitMain(init_fields_state());
+  gSetSubs(init_fields_state());
+  gWaitSubs(init_fields_state());
+  gSetMain(init_fields_state());
+
   gWaitMain(initial_energy_state());
   gSetSubs(initial_energy_state());
   gWaitSubs(initial_energy_state());
@@ -650,6 +670,9 @@ static void main_thread(void) {
   double local_energy = 0.0;
   double global_energy = 0.0;
   int current_halo_ready = 1;
+
+  start_phase_from_main(init_fields_state());
+  wait_phase_from_main(init_fields_state());
 
   exchange_y_halos_for(g_sim.u_curr);
   exchange_y_halos_for(g_sim.u_prev);
