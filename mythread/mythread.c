@@ -257,7 +257,7 @@ void ntdelay_(int n){
   static int vt=0; for(int i=0;i<n;i++) vt=(vt*1357+2581);
 }
 
-#define MAXCHECK 1000000
+#define MAXCHECK 10000000
 #define VLINE ,__LINE__
 #define PLINE ,int nl
 #define FWAIT(NM,COP) int Wait_##NM(volatile int *pv,int cv PLINE){ \

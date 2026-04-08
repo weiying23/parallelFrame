@@ -474,6 +474,7 @@ static void setup_thread_tasks(void) {
       task->y_end = y_end;
       task->partial_energy = 0.0;
 
+#ifdef DEBUG
       printf(
         "[Init] MPI=%d Group=%d Thread=%d role=%s global-y=[%d,%d) x=[%d,%d)\n",
         mpi_id,
@@ -485,6 +486,7 @@ static void setup_thread_tasks(void) {
         x_begin,
         x_end
       );
+#endif // DEBUG
     }
   }
 }
@@ -631,8 +633,11 @@ static void main_thread(void) {
 }
 
 void thread_run(void) {
-  printf("[info] mpi %d gid %d, pid %d, c %d, getcore %d\n", mpi_id, ti->igrp,
-    ti->ind, ti->indg, getcpuid());
+#ifdef DEBUG
+  printf("[info] mpi %d gid %d, pid %d, c %d, getcore %d\n",
+    mpi_id, ti->igrp, ti->ind, ti->indg, getcpuid());
+#endif // DEBUG
+
   if (ti->igrp < 0) {
     main_thread();
   } else if (ti->ind == 0) {
