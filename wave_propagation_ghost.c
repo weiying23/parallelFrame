@@ -19,8 +19,8 @@
  */
 
 #define NX 32000
-#define NY 32000
-#define NT 20
+#define NY 8000
+#define NT 480
 
 #define DT 0.001
 #define C0 0.1
@@ -45,7 +45,7 @@
 #endif
 
 #define HALO 1
-#define N_GROUPS 4
+#define N_GROUPS 1
 #define N_WORKERS 35
 #define THREADS_PER_GROUP (N_WORKERS + 1)
 #define ENERGY_REPORT_INTERVAL 60
@@ -72,11 +72,25 @@ typedef struct {
 typedef struct {
   int gid;
   int tid;
+  int cpu_id;
   int x_begin;
   int x_end;
   int y_begin;
   int y_end;
   double partial_energy;
+  double t_wait_init;
+  double t_work_init;
+  double t_wait_energy0;
+  double t_work_energy0;
+  double t_wait_compute;
+  double t_work_compute;
+  double t_wait_boundary;
+  double t_work_boundary;
+  double t_wait_energy;
+  double t_work_energy;
+  double t_comm;
+  double t_allreduce;
+  int energy_steps;
 } ThreadTask;
 
 static SimulationData g_sim = {0};
@@ -100,6 +114,31 @@ static inline int idx(int y, int x) {
 
 static inline int global_y_from_local(int local_y) {
   return g_sim.local_y_begin + (local_y - HALO);
+}
+
+static inline double wall_time(void) {
+  return MPI_Wtime();
+}
+
+static void reset_task_timers(ThreadTask *task) {
+  if (!task) {
+    return;
+  }
+  task->cpu_id = -1;
+  task->partial_energy = 0.0;
+  task->t_wait_init = 0.0;
+  task->t_work_init = 0.0;
+  task->t_wait_energy0 = 0.0;
+  task->t_work_energy0 = 0.0;
+  task->t_wait_compute = 0.0;
+  task->t_work_compute = 0.0;
+  task->t_wait_boundary = 0.0;
+  task->t_work_boundary = 0.0;
+  task->t_wait_energy = 0.0;
+  task->t_work_energy = 0.0;
+  task->t_comm = 0.0;
+  task->t_allreduce = 0.0;
+  task->energy_steps = 0;
 }
 
 static void split_range(int begin,int end,int parts,int index,int *sub_begin,int *sub_end) {
@@ -521,7 +560,7 @@ static void setup_group_thread_tasks(void) {
       task->x_end = x_end;
       task->y_begin = y_begin;
       task->y_end = y_end;
-      task->partial_energy = 0.0;
+      reset_task_timers(task);
 
 #ifdef DEBUG
       printf(
@@ -558,7 +597,7 @@ static void setup_single_group_tasks(void) {
     task->x_end = x_end;
     task->y_begin = y_begin;
     task->y_end = y_end;
-    task->partial_energy = 0.0;
+    reset_task_timers(task);
 
 #ifdef DEBUG
     printf(
@@ -585,13 +624,22 @@ static void setup_thread_tasks(void) {
 
 static void worker_thread(void) {
   ThreadTask *task = (ThreadTask*)ti->td;
+  double t0;
 
+  t0 = wall_time();
   wait_phase_from_worker(init_fields_state());
+  task->t_wait_init += wall_time() - t0;
+  t0 = wall_time();
   initialize_field_block(task);
+  task->t_work_init += wall_time() - t0;
   finish_phase_from_worker(init_fields_state());
 
+  t0 = wall_time();
   wait_phase_from_worker(initial_energy_state());
+  task->t_wait_energy0 += wall_time() - t0;
+  t0 = wall_time();
   task->partial_energy = compute_energy_block(task);
+  task->t_work_energy0 += wall_time() - t0;
   finish_phase_from_worker(initial_energy_state());
 
   for (int step = 0; step < NT; step++) {
@@ -599,45 +647,59 @@ static void worker_thread(void) {
     int boundary_state = boundary_phase_state(step);
     int energy_state = energy_phase_state(step);
 
+    t0 = wall_time();
     wait_phase_from_worker(compute_state);
-// #ifdef DEBUG
-    double beg = MPI_Wtime();
-// #endif // DEBUG
+    task->t_wait_compute += wall_time() - t0;
+    t0 = wall_time();
     compute_interior_block(task);
-// #ifdef DEBUG
-    double compute_time = MPI_Wtime() - beg;
-    // double sync_beg = MPI_Wtime();
-// #endif // DEBUG
+    task->t_work_compute += wall_time() - t0;
     finish_phase_from_worker(compute_state);
-// #ifdef DEBUG
-    // double sync_time = MPI_Wtime() - sync_beg;
-    printf("[worker] mpi %d gid %d, pid %d, compute step %d, time %.3f\n",
-      mpi_id, ti->igrp, ti->ind, step, compute_time);
-    // printf("[worker] mpi %d gid %d, pid %d, sync step %d, time %.3f\n",
-      // mpi_id, ti->igrp, ti->ind, step, sync_time);
-// #endif // DEBUG
+
+    t0 = wall_time();
     wait_phase_from_worker(boundary_state);
+    task->t_wait_boundary += wall_time() - t0;
+    t0 = wall_time();
     compute_boundary_block(task);
+    task->t_work_boundary += wall_time() - t0;
     finish_phase_from_worker(boundary_state);
 
     if (should_measure_energy_step(step)) {
+      t0 = wall_time();
       wait_phase_from_worker(energy_state);
+      task->t_wait_energy += wall_time() - t0;
+      t0 = wall_time();
       task->partial_energy = compute_energy_block(task);
+      task->t_work_energy += wall_time() - t0;
+      task->energy_steps += 1;
       finish_phase_from_worker(energy_state);
     }
   }
 }
 
+
 static void group_main_thread(void) {
+  ThreadTask *task = (ThreadTask*)ti->td;
+  double t0;
+
+  t0 = wall_time();
   gWaitMain(init_fields_state());
+  task->t_wait_init += wall_time() - t0;
   gSetSubs(init_fields_state());
+  t0 = wall_time();
   gWaitSubs(init_fields_state());
+  task->t_wait_init += wall_time() - t0;
   gSetMain(init_fields_state());
 
+  t0 = wall_time();
   gWaitMain(initial_energy_state());
+  task->t_wait_energy0 += wall_time() - t0;
   gSetSubs(initial_energy_state());
+  t0 = wall_time();
   gWaitSubs(initial_energy_state());
+  task->t_wait_energy0 += wall_time() - t0;
+  t0 = wall_time();
   g_group_energy[ti->igrp] = reduce_group_worker_energy(ti->igrp);
+  task->t_work_energy0 += wall_time() - t0;
   gSetMain(initial_energy_state());
 
   for (int step = 0; step < NT; step++) {
@@ -645,42 +707,71 @@ static void group_main_thread(void) {
     int boundary_state = boundary_phase_state(step);
     int energy_state = energy_phase_state(step);
 
+    t0 = wall_time();
     gWaitMain(compute_state);
+    task->t_wait_compute += wall_time() - t0;
     gSetSubs(compute_state);
+    t0 = wall_time();
     gWaitSubs(compute_state);
+    task->t_wait_compute += wall_time() - t0;
     gSetMain(compute_state);
 
+    t0 = wall_time();
     gWaitMain(boundary_state);
+    task->t_wait_boundary += wall_time() - t0;
     gSetSubs(boundary_state);
+    t0 = wall_time();
     gWaitSubs(boundary_state);
+    task->t_wait_boundary += wall_time() - t0;
     gSetMain(boundary_state);
 
     if (should_measure_energy_step(step)) {
+      t0 = wall_time();
       gWaitMain(energy_state);
+      task->t_wait_energy += wall_time() - t0;
       gSetSubs(energy_state);
+      t0 = wall_time();
       gWaitSubs(energy_state);
+      task->t_wait_energy += wall_time() - t0;
+      t0 = wall_time();
       g_group_energy[ti->igrp] = reduce_group_worker_energy(ti->igrp);
+      task->t_work_energy += wall_time() - t0;
+      task->energy_steps += 1;
       gSetMain(energy_state);
     }
   }
 }
 
 static void main_thread(void) {
+  ThreadTask *task = (ThreadTask*)ti->td;
   double start_time;
   double local_energy = 0.0;
   double global_energy = 0.0;
   int current_halo_ready = 1;
+  double t0;
 
+  reset_task_timers(task);
+
+  t0 = wall_time();
   start_phase_from_main(init_fields_state());
   wait_phase_from_main(init_fields_state());
+  task->t_wait_init += wall_time() - t0;
 
+  t0 = wall_time();
   exchange_y_halos_for(g_sim.u_curr);
   exchange_y_halos_for(g_sim.u_prev);
+  task->t_comm += wall_time() - t0;
 
+  t0 = wall_time();
   start_phase_from_main(initial_energy_state());
   wait_phase_from_main(initial_energy_state());
+  task->t_wait_energy0 += wall_time() - t0;
+  t0 = wall_time();
   local_energy = accumulate_worker_energy();
+  task->t_work_energy0 += wall_time() - t0;
+  t0 = wall_time();
   MPI_Allreduce(&local_energy, &global_energy, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  task->t_allreduce += wall_time() - t0;
   g_sim.initial_energy = global_energy;
 
   if (mpi_id == 0) {
@@ -699,32 +790,49 @@ static void main_thread(void) {
     int request_count = 0;
 
     if (!current_halo_ready) {
+      t0 = wall_time();
       begin_y_halo_exchange_for(g_sim.u_curr, requests, &request_count);
+      task->t_comm += wall_time() - t0;
     }
 
+    t0 = wall_time();
     start_phase_from_main(compute_state);
     wait_phase_from_main(compute_state);
+    task->t_wait_compute += wall_time() - t0;
 
     if (!current_halo_ready) {
+      t0 = wall_time();
       end_y_halo_exchange_for(g_sim.u_curr, requests, request_count);
+      task->t_comm += wall_time() - t0;
       current_halo_ready = 1;
     }
 
+    t0 = wall_time();
     start_phase_from_main(boundary_state);
     wait_phase_from_main(boundary_state);
+    task->t_wait_boundary += wall_time() - t0;
 
     swap_fields();
     current_halo_ready = 0;
 
     if (need_energy) {
+      t0 = wall_time();
       begin_y_halo_exchange_for(g_sim.u_curr, requests, &request_count);
       end_y_halo_exchange_for(g_sim.u_curr, requests, request_count);
+      task->t_comm += wall_time() - t0;
       current_halo_ready = 1;
 
+      t0 = wall_time();
       start_phase_from_main(energy_state);
       wait_phase_from_main(energy_state);
+      task->t_wait_energy += wall_time() - t0;
+      t0 = wall_time();
       local_energy = accumulate_worker_energy();
+      task->t_work_energy += wall_time() - t0;
+      t0 = wall_time();
       MPI_Allreduce(&local_energy, &global_energy, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+      task->t_allreduce += wall_time() - t0;
+      task->energy_steps += 1;
 
       if (mpi_id == 0) {
         double rel_diff = (g_sim.initial_energy > 0.0)
@@ -755,10 +863,17 @@ static void main_thread(void) {
 }
 
 void thread_run(void) {
+  ThreadTask *task = (ThreadTask*)ti->td;
 #ifdef DEBUG
   printf("[info] mpi %d gid %d, pid %d, c %d, getcore %d\n",
     mpi_id, ti->igrp, ti->ind, ti->indg, getcpuid());
 #endif // DEBUG
+
+  if (task) {
+    task->gid = ti->igrp;
+    task->tid = ti->ind;
+    task->cpu_id = getcpuid();
+  }
 
   if (ti->igrp < 0) {
     main_thread();
@@ -771,6 +886,102 @@ void thread_run(void) {
   }
 }
 
+static const char *task_role_name(const ThreadTask *task) {
+  if (!task) {
+    return "null";
+  }
+  if (task->gid < 0) {
+    return "main";
+  }
+  if (uses_group_threads() && task->tid == 0) {
+    return "group-main";
+  }
+  return "worker";
+}
+
+static double task_total_time(const ThreadTask *task) {
+  if (!task) {
+    return 0.0;
+  }
+  return task->t_wait_init + task->t_work_init +
+         task->t_wait_energy0 + task->t_work_energy0 +
+         task->t_wait_compute + task->t_work_compute +
+         task->t_wait_boundary + task->t_work_boundary +
+         task->t_wait_energy + task->t_work_energy +
+         task->t_comm + task->t_allreduce;
+}
+
+static void print_one_task_timing(int mpi_rank,int mpi_size,int node_size,const ThreadTask *task) {
+  int global_y_begin = -1;
+  int global_y_end = -1;
+  double total = task_total_time(task);
+
+  if (task && task->y_end > task->y_begin && task->y_begin >= HALO) {
+    global_y_begin = g_sim.local_y_begin + (task->y_begin - HALO);
+    global_y_end = g_sim.local_y_begin + (task->y_end - HALO);
+  }
+
+  // printf(
+    // "[Timing] rank %d/%d node_size=%d gid=%d tid=%d role=%s cpu=%d "
+    // "x=[%d,%d) y=[%d,%d) global-y=[%d,%d) "
+    // "wait(init=%.6f energy0=%.6f compute=%.6f boundary=%.6f energy=%.6f) "
+    // "work(init=%.6f energy0=%.6f compute=%.6f boundary=%.6f energy=%.6f) "
+    // "comm=%.6f allreduce=%.6f energy_steps=%d total=%.6f\n",
+    // mpi_rank,
+    // mpi_size,
+    // node_size,
+    // task ? task->gid : -999,
+    // task ? task->tid : -999,
+    // task_role_name(task),
+    // task ? task->cpu_id : -1,
+    // task ? task->x_begin : 0,
+    // task ? task->x_end : 0,
+    // task ? task->y_begin : 0,
+    // task ? task->y_end : 0,
+    // global_y_begin,
+    // global_y_end,
+    // task ? task->t_wait_init : 0.0,
+    // task ? task->t_wait_energy0 : 0.0,
+    // task ? task->t_wait_compute : 0.0,
+    // task ? task->t_wait_boundary : 0.0,
+    // task ? task->t_wait_energy : 0.0,
+    // task ? task->t_work_init : 0.0,
+    // task ? task->t_work_energy0 : 0.0,
+    // task ? task->t_work_compute : 0.0,
+    // task ? task->t_work_boundary : 0.0,
+    // task ? task->t_work_energy : 0.0,
+    // task ? task->t_comm : 0.0,
+    // task ? task->t_allreduce : 0.0,
+    // task ? task->energy_steps : 0,
+    // total
+  // );
+}
+
+static void print_timing_report(int mpi_rank,int mpi_size,int node_size) {
+  for (int r = 0; r < mpi_size; r++) {
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (mpi_rank == r) {
+      printf("========== Timing Report rank %d/%d ==========\n", mpi_rank, mpi_size);
+      print_one_task_timing(mpi_rank, mpi_size, node_size, (ThreadTask*)md.tm.td);
+      if (uses_group_threads()) {
+        for (int g = 0; g < md.ngrp; g++) {
+          threadGroup *pg = md.grps[g];
+          for (int t = 0; t < pg->Nthreads; t++) {
+            print_one_task_timing(mpi_rank, mpi_size, node_size, (ThreadTask*)pg->threads[t].td);
+          }
+        }
+      } else {
+        int worker_count = md.Nthreads - 1;
+        for (int t = 0; t < worker_count; t++) {
+          print_one_task_timing(mpi_rank, mpi_size, node_size, (ThreadTask*)md.threads[t].td);
+        }
+      }
+      fflush(stdout);
+    }
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+}
+
 int main(int argc,char **argv) {
   int mpi_rank, mpi_size;
   int NCorePClu = 38;
@@ -778,13 +989,21 @@ int main(int argc,char **argv) {
   int NCorePGrp = 37;
   int NThPGrp = THREADS_PER_GROUP;
   int NGrpPProc = N_GROUPS;
-  int NProcPNode = 4;
+  int NProcPNode = 16;
   int ManageCoreId = 36;
   int err;
 
   MPI_Init(&argc, &argv);
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+
+  
+  MPI_Comm node_comm;
+  MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm);
+  int node_size;
+  MPI_Comm_size(node_comm, &node_size);
+
+  NProcPNode = node_size;
 
   if (NX < 3 || NY < 3) {
     if (mpi_rank == 0) {
@@ -827,6 +1046,28 @@ int main(int argc,char **argv) {
     printf("Energy diagnostics   : initial + every %d steps + final\n", ENERGY_REPORT_INTERVAL);
     printf("============================================\n");
   }
+  fflush(stdout);
+
+  // for (int r = 0; r < mpi_size; r++) {
+    MPI_Barrier(MPI_COMM_WORLD);
+    // if (mpi_rank == r) {
+      printf(
+        "[Domain] rank %d/%d node_size=%d global-y=[%d,%d) local_ny=%d halo=%d neighbors(down=%d up=%d) x-update=[1,%d)\n",
+        mpi_rank,
+        mpi_size,
+        node_size,
+        g_sim.local_y_begin,
+        g_sim.local_y_end,
+        g_sim.local_ny,
+        HALO,
+        g_sim.neighbor_down,
+        g_sim.neighbor_up,
+        NX - 1
+      );
+      // fflush(stdout);
+    // }
+  // }
+  MPI_Barrier(MPI_COMM_WORLD);
 
   // NProcPNode = mpi_size;
   err = InitThreads(
@@ -855,6 +1096,8 @@ int main(int argc,char **argv) {
   StartThreads(thread_run);
   thread_run();
   EndThreads();
+
+  print_timing_report(mpi_rank, mpi_size, node_size);
 
   free_group_energy();
   free_simulation();
