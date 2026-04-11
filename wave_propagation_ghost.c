@@ -59,11 +59,20 @@ typedef struct {
   double *u_prev;
   double *u_curr;
   double *u_next;
+  int local_x_begin;
+  int local_x_end;
+  int local_nx;
   int local_y_begin;
   int local_y_end;
   int local_ny;
   int mpi_rank;
   int mpi_size;
+  int proc_x;
+  int proc_y;
+  int proc_px;
+  int proc_py;
+  int neighbor_left;
+  int neighbor_right;
   int neighbor_up;
   int neighbor_down;
   double initial_energy;
@@ -98,6 +107,10 @@ static double *g_send_up = NULL;
 static double *g_recv_up = NULL;
 static double *g_send_down = NULL;
 static double *g_recv_down = NULL;
+static double *g_send_left = NULL;
+static double *g_recv_left = NULL;
+static double *g_send_right = NULL;
+static double *g_recv_right = NULL;
 static double *g_group_energy = NULL;
 
 int _gettdsize_() {
@@ -109,7 +122,11 @@ int _getgdsize_() {
 }
 
 static inline int idx(int y, int x) {
-  return y * NX + x;
+  return y * (g_sim.local_nx + 2 * HALO) + x;
+}
+
+static inline int global_x_from_local(int local_x) {
+  return g_sim.local_x_begin + (local_x - HALO);
 }
 
 static inline int global_y_from_local(int local_y) {
@@ -228,18 +245,45 @@ static void *xcalloc(size_t count,size_t size) {
   return p;
 }
 
-static void setup_process_domain(int mpi_rank,int mpi_size) {
-  split_range(0, NY, mpi_size, mpi_rank, &g_sim.local_y_begin, &g_sim.local_y_end);
-  g_sim.local_ny = g_sim.local_y_end - g_sim.local_y_begin;
-  g_sim.neighbor_down = (g_sim.local_y_begin > 0) ? mpi_rank - 1 : -1;
-  g_sim.neighbor_up = (g_sim.local_y_end < NY) ? mpi_rank + 1 : -1;
+static void choose_process_grid(int mpi_size,int *px,int *py) {
+  int best = 1;
+  int limit = (int)sqrt((double)mpi_size);
+
+  for (int f = 1; f <= limit; f++) {
+    if ((mpi_size % f) == 0) {
+      best = f;
+    }
+  }
+  *px = best;
+  *py = mpi_size / best;
 }
 
-static double initial_condition_value(int global_y,int x) {
+static void setup_process_domain(int mpi_rank,int mpi_size) {
+  int px, py;
+
+  choose_process_grid(mpi_size, &px, &py);
+
+  g_sim.proc_px = px;
+  g_sim.proc_py = py;
+  g_sim.proc_x = mpi_rank % px;
+  g_sim.proc_y = mpi_rank / px;
+
+  split_range(0, NX, px, g_sim.proc_x, &g_sim.local_x_begin, &g_sim.local_x_end);
+  split_range(0, NY, py, g_sim.proc_y, &g_sim.local_y_begin, &g_sim.local_y_end);
+  g_sim.local_nx = g_sim.local_x_end - g_sim.local_x_begin;
+  g_sim.local_ny = g_sim.local_y_end - g_sim.local_y_begin;
+
+  g_sim.neighbor_left = (g_sim.proc_x > 0) ? (mpi_rank - 1) : -1;
+  g_sim.neighbor_right = (g_sim.proc_x + 1 < px) ? (mpi_rank + 1) : -1;
+  g_sim.neighbor_down = (g_sim.proc_y > 0) ? (mpi_rank - px) : -1;
+  g_sim.neighbor_up = (g_sim.proc_y + 1 < py) ? (mpi_rank + px) : -1;
+}
+
+static double initial_condition_value(int global_y,int global_x) {
   double cx = 0.5 * LX;
   double cy = 0.5 * LY;
   double sigma = 0.06 * ((LX < LY) ? LX : LY);
-  double dx = x * DX - cx;
+  double dx = global_x * DX - cx;
   double dy = global_y * DY - cy;
 
   return exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma));
@@ -250,11 +294,12 @@ static void initialize_field_block(const ThreadTask *task) {
     int global_y = global_y_from_local(y);
 
     for (int x = task->x_begin; x < task->x_end; x++) {
+      int global_x = global_x_from_local(x);
       int p = idx(y, x);
       double value = 0.0;
 
-      if (global_y != 0 && global_y != NY - 1) {
-        value = initial_condition_value(global_y, x);
+      if (global_x != 0 && global_x != NX - 1 && global_y != 0 && global_y != NY - 1) {
+        value = initial_condition_value(global_y, global_x);
       }
       g_sim.u_curr[p] = value;
       g_sim.u_prev[p] = value;
@@ -271,16 +316,20 @@ static void init_simulation(int mpi_rank,int mpi_size) {
   g_sim.mpi_size = mpi_size;
 
   setup_process_domain(mpi_rank, mpi_size);
-  plane_size = (size_t)(g_sim.local_ny + 2 * HALO) * (size_t)NX;
+  plane_size = (size_t)(g_sim.local_ny + 2 * HALO) * (size_t)(g_sim.local_nx + 2 * HALO);
 
   g_sim.u_prev = (double*)xcalloc(plane_size, sizeof(double));
   g_sim.u_curr = (double*)xcalloc(plane_size, sizeof(double));
   g_sim.u_next = (double*)xcalloc(plane_size, sizeof(double));
 
-  g_send_up = (double*)xcalloc((size_t)NX, sizeof(double));
-  g_recv_up = (double*)xcalloc((size_t)NX, sizeof(double));
-  g_send_down = (double*)xcalloc((size_t)NX, sizeof(double));
-  g_recv_down = (double*)xcalloc((size_t)NX, sizeof(double));
+  g_send_up = (double*)xcalloc((size_t)g_sim.local_nx, sizeof(double));
+  g_recv_up = (double*)xcalloc((size_t)g_sim.local_nx, sizeof(double));
+  g_send_down = (double*)xcalloc((size_t)g_sim.local_nx, sizeof(double));
+  g_recv_down = (double*)xcalloc((size_t)g_sim.local_nx, sizeof(double));
+  g_send_left = (double*)xcalloc((size_t)(g_sim.local_ny + 2 * HALO), sizeof(double));
+  g_recv_left = (double*)xcalloc((size_t)(g_sim.local_ny + 2 * HALO), sizeof(double));
+  g_send_right = (double*)xcalloc((size_t)(g_sim.local_ny + 2 * HALO), sizeof(double));
+  g_recv_right = (double*)xcalloc((size_t)(g_sim.local_ny + 2 * HALO), sizeof(double));
 }
 
 static void free_simulation(void) {
@@ -291,12 +340,20 @@ static void free_simulation(void) {
   free(g_recv_up);
   free(g_send_down);
   free(g_recv_down);
+  free(g_send_left);
+  free(g_recv_left);
+  free(g_send_right);
+  free(g_recv_right);
 
   memset(&g_sim, 0, sizeof(g_sim));
   g_send_up = NULL;
   g_recv_up = NULL;
   g_send_down = NULL;
   g_recv_down = NULL;
+  g_send_left = NULL;
+  g_recv_left = NULL;
+  g_send_right = NULL;
+  g_recv_right = NULL;
 }
 
 static void free_group_energy(void) {
@@ -305,116 +362,150 @@ static void free_group_energy(void) {
 }
 
 static void enforce_dirichlet_boundaries(double *field) {
-  for (int y = 0; y < g_sim.local_ny + 2 * HALO; y++) {
-    field[idx(y, 0)] = 0.0;
-    field[idx(y, NX - 1)] = 0.0;
+  int stride = g_sim.local_nx + 2 * HALO;
+  int height = g_sim.local_ny + 2 * HALO;
+
+  if (g_sim.local_x_begin == 0) {
+    for (int y = 0; y < height; y++) {
+      field[idx(y, HALO)] = 0.0;
+    }
+  }
+  if (g_sim.local_x_end == NX) {
+    int x_right = HALO + g_sim.local_nx - 1;
+    for (int y = 0; y < height; y++) {
+      field[idx(y, x_right)] = 0.0;
+    }
+  }
+
+  if (g_sim.neighbor_left < 0) {
+    for (int y = 0; y < height; y++) {
+      field[idx(y, 0)] = 0.0;
+    }
+  }
+  if (g_sim.neighbor_right < 0) {
+    int x_halo = HALO + g_sim.local_nx;
+    for (int y = 0; y < height; y++) {
+      field[idx(y, x_halo)] = 0.0;
+    }
   }
 
   if (g_sim.neighbor_down < 0) {
-    memset(&field[idx(0, 0)], 0, (size_t)NX * sizeof(double));
+    memset(&field[idx(0, 0)], 0, (size_t)stride * sizeof(double));
   }
   if (g_sim.neighbor_up < 0) {
-    memset(&field[idx(g_sim.local_ny + HALO, 0)], 0, (size_t)NX * sizeof(double));
+    memset(&field[idx(g_sim.local_ny + HALO, 0)], 0, (size_t)stride * sizeof(double));
   }
 }
 
 static void zero_physical_y_boundaries(double *field) {
+  int stride = g_sim.local_nx + 2 * HALO;
+
   if (g_sim.local_y_begin == 0) {
-    memset(&field[idx(HALO, 0)], 0, (size_t)NX * sizeof(double));
+    memset(&field[idx(HALO, 0)], 0, (size_t)stride * sizeof(double));
   }
   if (g_sim.local_y_end == NY) {
-    memset(&field[idx(g_sim.local_ny, 0)], 0, (size_t)NX * sizeof(double));
+    memset(&field[idx(g_sim.local_ny, 0)], 0, (size_t)stride * sizeof(double));
   }
 }
 
-static void exchange_y_halos_for(double *field) {
-  MPI_Status status;
-
-  enforce_dirichlet_boundaries(field);
-  zero_physical_y_boundaries(field);
-
-  if (g_sim.neighbor_up >= 0) {
-    memcpy(g_send_up, &field[idx(g_sim.local_ny, 0)], (size_t)NX * sizeof(double));
-    MPI_Sendrecv(
-      g_send_up, NX, MPI_DOUBLE, g_sim.neighbor_up, 100,
-      g_recv_up, NX, MPI_DOUBLE, g_sim.neighbor_up, 101,
-      MPI_COMM_WORLD, &status
-    );
-    memcpy(&field[idx(g_sim.local_ny + HALO, 0)], g_recv_up, (size_t)NX * sizeof(double));
-  } else {
-    memset(&field[idx(g_sim.local_ny + HALO, 0)], 0, (size_t)NX * sizeof(double));
-  }
-
-  if (g_sim.neighbor_down >= 0) {
-    memcpy(g_send_down, &field[idx(HALO, 0)], (size_t)NX * sizeof(double));
-    MPI_Sendrecv(
-      g_send_down, NX, MPI_DOUBLE, g_sim.neighbor_down, 101,
-      g_recv_down, NX, MPI_DOUBLE, g_sim.neighbor_down, 100,
-      MPI_COMM_WORLD, &status
-    );
-    memcpy(&field[idx(0, 0)], g_recv_down, (size_t)NX * sizeof(double));
-  } else {
-    memset(&field[idx(0, 0)], 0, (size_t)NX * sizeof(double));
-  }
-
-  enforce_dirichlet_boundaries(field);
-  zero_physical_y_boundaries(field);
-}
-
-static void begin_y_halo_exchange_for(double *field,MPI_Request requests[4],int *request_count) {
+static void begin_halo_exchange_for(double *field,MPI_Request requests[8],int *request_count) {
   int count = 0;
+  int height = g_sim.local_ny + 2 * HALO;
 
   enforce_dirichlet_boundaries(field);
   zero_physical_y_boundaries(field);
 
   if (g_sim.neighbor_up >= 0) {
-    memcpy(g_send_up, &field[idx(g_sim.local_ny, 0)], (size_t)NX * sizeof(double));
-    MPI_Irecv(g_recv_up, NX, MPI_DOUBLE, g_sim.neighbor_up, 101, MPI_COMM_WORLD, &requests[count++]);
-    MPI_Isend(g_send_up, NX, MPI_DOUBLE, g_sim.neighbor_up, 100, MPI_COMM_WORLD, &requests[count++]);
-  } else {
-    memset(&field[idx(g_sim.local_ny + HALO, 0)], 0, (size_t)NX * sizeof(double));
+    memcpy(g_send_up, &field[idx(g_sim.local_ny, HALO)], (size_t)g_sim.local_nx * sizeof(double));
+    MPI_Irecv(g_recv_up, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_up, 101, MPI_COMM_WORLD, &requests[count++]);
+    MPI_Isend(g_send_up, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_up, 100, MPI_COMM_WORLD, &requests[count++]);
   }
 
   if (g_sim.neighbor_down >= 0) {
-    memcpy(g_send_down, &field[idx(HALO, 0)], (size_t)NX * sizeof(double));
-    MPI_Irecv(g_recv_down, NX, MPI_DOUBLE, g_sim.neighbor_down, 100, MPI_COMM_WORLD, &requests[count++]);
-    MPI_Isend(g_send_down, NX, MPI_DOUBLE, g_sim.neighbor_down, 101, MPI_COMM_WORLD, &requests[count++]);
-  } else {
-    memset(&field[idx(0, 0)], 0, (size_t)NX * sizeof(double));
+    memcpy(g_send_down, &field[idx(HALO, HALO)], (size_t)g_sim.local_nx * sizeof(double));
+    MPI_Irecv(g_recv_down, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_down, 100, MPI_COMM_WORLD, &requests[count++]);
+    MPI_Isend(g_send_down, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_down, 101, MPI_COMM_WORLD, &requests[count++]);
+  }
+
+  if (g_sim.neighbor_left >= 0) {
+    int x_send = HALO;
+    for (int y = 0; y < height; y++) {
+      g_send_left[y] = field[idx(y, x_send)];
+    }
+    MPI_Irecv(g_recv_left, height, MPI_DOUBLE, g_sim.neighbor_left, 200, MPI_COMM_WORLD, &requests[count++]);
+    MPI_Isend(g_send_left, height, MPI_DOUBLE, g_sim.neighbor_left, 201, MPI_COMM_WORLD, &requests[count++]);
+  }
+
+  if (g_sim.neighbor_right >= 0) {
+    int x_send = HALO + g_sim.local_nx - 1;
+    for (int y = 0; y < height; y++) {
+      g_send_right[y] = field[idx(y, x_send)];
+    }
+    MPI_Irecv(g_recv_right, height, MPI_DOUBLE, g_sim.neighbor_right, 201, MPI_COMM_WORLD, &requests[count++]);
+    MPI_Isend(g_send_right, height, MPI_DOUBLE, g_sim.neighbor_right, 200, MPI_COMM_WORLD, &requests[count++]);
   }
 
   *request_count = count;
 }
 
-static void end_y_halo_exchange_for(double *field,MPI_Request requests[4],int request_count) {
+static void end_halo_exchange_for(double *field,MPI_Request requests[8],int request_count) {
+  int height = g_sim.local_ny + 2 * HALO;
+
   if (request_count > 0) {
     MPI_Waitall(request_count, requests, MPI_STATUSES_IGNORE);
   }
 
   if (g_sim.neighbor_up >= 0) {
-    memcpy(&field[idx(g_sim.local_ny + HALO, 0)], g_recv_up, (size_t)NX * sizeof(double));
-  } else {
-    memset(&field[idx(g_sim.local_ny + HALO, 0)], 0, (size_t)NX * sizeof(double));
+    memcpy(&field[idx(g_sim.local_ny + HALO, HALO)], g_recv_up, (size_t)g_sim.local_nx * sizeof(double));
   }
 
   if (g_sim.neighbor_down >= 0) {
-    memcpy(&field[idx(0, 0)], g_recv_down, (size_t)NX * sizeof(double));
-  } else {
-    memset(&field[idx(0, 0)], 0, (size_t)NX * sizeof(double));
+    memcpy(&field[idx(0, HALO)], g_recv_down, (size_t)g_sim.local_nx * sizeof(double));
+  }
+
+  if (g_sim.neighbor_left >= 0) {
+    int x_recv = 0;
+    for (int y = 0; y < height; y++) {
+      field[idx(y, x_recv)] = g_recv_left[y];
+    }
+  }
+
+  if (g_sim.neighbor_right >= 0) {
+    int x_recv = HALO + g_sim.local_nx;
+    for (int y = 0; y < height; y++) {
+      field[idx(y, x_recv)] = g_recv_right[y];
+    }
   }
 
   enforce_dirichlet_boundaries(field);
   zero_physical_y_boundaries(field);
 }
 
-static void compute_block_rows(const ThreadTask *task,int y_begin,int y_end) {
+static void exchange_halos_for(double *field) {
+  MPI_Request requests[8];
+  int request_count = 0;
+
+  begin_halo_exchange_for(field, requests, &request_count);
+  end_halo_exchange_for(field, requests, request_count);
+}
+
+static void compute_block_region(const ThreadTask *task,int y_begin,int y_end,int x_begin,int x_end) {
+  (void)task;
+
   for (int y = y_begin; y < y_end; y++) {
     int global_y = global_y_from_local(y);
 
     if (global_y == 0 || global_y == NY - 1) {
       continue;
     }
-    for (int x = task->x_begin; x < task->x_end; x++) {
+
+    for (int x = x_begin; x < x_end; x++) {
+      int global_x = global_x_from_local(x);
+
+      if (global_x == 0 || global_x == NX - 1) {
+        continue;
+      }
+
       double u_ij = g_sim.u_curr[idx(y, x)];
       double d2x = (g_sim.u_curr[idx(y, x - 1)] - 2.0 * u_ij + g_sim.u_curr[idx(y, x + 1)]) / (DX * DX);
       double d2y = (g_sim.u_curr[idx(y - 1, x)] - 2.0 * u_ij + g_sim.u_curr[idx(y + 1, x)]) / (DY * DY);
@@ -428,6 +519,8 @@ static void compute_block_rows(const ThreadTask *task,int y_begin,int y_end) {
 static void compute_interior_block(const ThreadTask *task) {
   int y_begin = task->y_begin;
   int y_end = task->y_end;
+  int x_begin = task->x_begin;
+  int x_end = task->x_end;
 
   if (g_sim.neighbor_down >= 0 && y_begin < HALO + 1) {
     y_begin = HALO + 1;
@@ -435,23 +528,60 @@ static void compute_interior_block(const ThreadTask *task) {
   if (g_sim.neighbor_up >= 0 && y_end > g_sim.local_ny) {
     y_end = g_sim.local_ny;
   }
-  if (y_begin < y_end) {
-    compute_block_rows(task, y_begin, y_end);
+
+  if (g_sim.neighbor_left >= 0 && x_begin < HALO + 1) {
+    x_begin = HALO + 1;
+  }
+  if (g_sim.neighbor_right >= 0 && x_end > g_sim.local_nx) {
+    x_end = g_sim.local_nx;
+  }
+
+  if (y_begin < y_end && x_begin < x_end) {
+    compute_block_region(task, y_begin, y_end, x_begin, x_end);
   }
 }
 
 static void compute_boundary_block(const ThreadTask *task) {
   int lower_row = HALO;
   int upper_row = g_sim.local_ny;
+  int left_col = HALO;
+  int right_col = g_sim.local_nx;
+  int x_begin = task->x_begin;
+  int x_end = task->x_end;
+  int y_begin = task->y_begin;
+  int y_end = task->y_end;
 
-  if (g_sim.neighbor_down >= 0 && task->y_begin <= lower_row && lower_row < task->y_end) {
-    compute_block_rows(task, lower_row, lower_row + 1);
+  if (x_begin < HALO) {
+    x_begin = HALO;
+  }
+  if (x_end > HALO + g_sim.local_nx) {
+    x_end = HALO + g_sim.local_nx;
+  }
+  if (y_begin < HALO) {
+    y_begin = HALO;
+  }
+  if (y_end > HALO + g_sim.local_ny) {
+    y_end = HALO + g_sim.local_ny;
+  }
+
+  if (g_sim.neighbor_down >= 0 && y_begin <= lower_row && lower_row < y_end) {
+    compute_block_region(task, lower_row, lower_row + 1, x_begin, x_end);
   }
   if (g_sim.neighbor_up >= 0 &&
       upper_row != lower_row &&
-      task->y_begin <= upper_row &&
-      upper_row < task->y_end) {
-    compute_block_rows(task, upper_row, upper_row + 1);
+      y_begin <= upper_row &&
+      upper_row < y_end) {
+    compute_block_region(task, upper_row, upper_row + 1, x_begin, x_end);
+  }
+
+  if (g_sim.neighbor_left >= 0 && x_begin <= left_col && left_col < x_end) {
+    compute_block_region(task, y_begin, y_end, left_col, left_col + 1);
+  }
+  if (g_sim.neighbor_right >= 0 &&
+      right_col != left_col &&
+      x_begin <= right_col &&
+      right_col < x_end) {
+    compute_block_region(task, y_begin, y_end, right_col, right_col + 1);
   }
 }
 
@@ -467,8 +597,11 @@ static double compute_energy_block(const ThreadTask *task) {
     return 0.0;
   }
 
-  x_edge_begin = (task->x_begin == 1) ? 0 : task->x_begin;
+  x_edge_begin = (task->x_begin == HALO) ? (HALO - 1) : task->x_begin;
   x_edge_end = task->x_end;
+  if (x_edge_end > HALO + g_sim.local_nx) {
+    x_edge_end = HALO + g_sim.local_nx;
+  }
 
   for (int y = task->y_begin; y < task->y_end; y++) {
     int global_y = global_y_from_local(y);
@@ -548,10 +681,10 @@ static void setup_group_thread_tasks(void) {
       int x_begin, x_end;
 
       if (t == 0 || worker_count <= 0) {
-        x_begin = 1;
-        x_end = 1;
+        x_begin = HALO;
+        x_end = HALO;
       } else {
-        split_range(1, NX - 1, worker_count, t - 1, &x_begin, &x_end);
+        split_range(HALO, HALO + g_sim.local_nx, worker_count, t - 1, &x_begin, &x_end);
       }
 
       task->gid = g;
@@ -589,7 +722,7 @@ static void setup_single_group_tasks(void) {
     ThreadTask *task = (ThreadTask*)pti->td;
     int x_begin, x_end;
 
-    split_range(1, NX - 1, worker_count, t, &x_begin, &x_end);
+    split_range(HALO, HALO + g_sim.local_nx, worker_count, t, &x_begin, &x_end);
 
     task->gid = 0;
     task->tid = t;
@@ -758,8 +891,8 @@ static void main_thread(void) {
   task->t_wait_init += wall_time() - t0;
 
   t0 = wall_time();
-  exchange_y_halos_for(g_sim.u_curr);
-  exchange_y_halos_for(g_sim.u_prev);
+  exchange_halos_for(g_sim.u_curr);
+  exchange_halos_for(g_sim.u_prev);
   task->t_comm += wall_time() - t0;
 
   t0 = wall_time();
@@ -786,12 +919,12 @@ static void main_thread(void) {
     int boundary_state = boundary_phase_state(step);
     int energy_state = energy_phase_state(step);
     int need_energy = should_measure_energy_step(step);
-    MPI_Request requests[4];
+    MPI_Request requests[8];
     int request_count = 0;
 
     if (!current_halo_ready) {
       t0 = wall_time();
-      begin_y_halo_exchange_for(g_sim.u_curr, requests, &request_count);
+      begin_halo_exchange_for(g_sim.u_curr, requests, &request_count);
       task->t_comm += wall_time() - t0;
     }
 
@@ -802,7 +935,7 @@ static void main_thread(void) {
 
     if (!current_halo_ready) {
       t0 = wall_time();
-      end_y_halo_exchange_for(g_sim.u_curr, requests, request_count);
+      end_halo_exchange_for(g_sim.u_curr, requests, request_count);
       task->t_comm += wall_time() - t0;
       current_halo_ready = 1;
     }
@@ -817,8 +950,8 @@ static void main_thread(void) {
 
     if (need_energy) {
       t0 = wall_time();
-      begin_y_halo_exchange_for(g_sim.u_curr, requests, &request_count);
-      end_y_halo_exchange_for(g_sim.u_curr, requests, request_count);
+      begin_halo_exchange_for(g_sim.u_curr, requests, &request_count);
+      end_halo_exchange_for(g_sim.u_curr, requests, request_count);
       task->t_comm += wall_time() - t0;
       current_halo_ready = 1;
 
@@ -1012,9 +1145,9 @@ int main(int argc,char **argv) {
     MPI_Finalize();
     return 1;
   }
-  if (mpi_size > NY) {
+  if ((long long)mpi_size > (long long)NX * (long long)NY) {
     if (mpi_rank == 0) {
-      fprintf(stderr, "[Error] mpi_size=%d is larger than NY=%d\n", mpi_size, NY);
+      fprintf(stderr, "[Error] mpi_size=%d is larger than NX*NY=%lld\n", mpi_size, (long long)NX * (long long)NY);
     }
     MPI_Finalize();
     return 1;
@@ -1028,6 +1161,20 @@ int main(int argc,char **argv) {
   }
 
   init_simulation(mpi_rank, mpi_size);
+  if (g_sim.local_nx <= 0 || g_sim.local_ny <= 0) {
+    fprintf(
+      stderr,
+      "[Error] MPI=%d: invalid 2D decomposition Px=%d Py=%d local_nx=%d local_ny=%d\n",
+      mpi_rank,
+      g_sim.proc_px,
+      g_sim.proc_py,
+      g_sim.local_nx,
+      g_sim.local_ny
+    );
+    free_simulation();
+    MPI_Finalize();
+    return 1;
+  }
 
   if (mpi_rank == 0) {
     printf("============================================\n");
@@ -1038,11 +1185,12 @@ int main(int argc,char **argv) {
     printf("Grid spacing         : dx=%.6e  dy=%.6e\n", DX, DY);
     printf("Time steps           : %d\n", NT);
     printf("MPI processes        : %d\n", mpi_size);
+    printf("MPI process grid     : %d x %d\n", g_sim.proc_px, g_sim.proc_py);
     printf("Thread groups/rank   : %d\n", N_GROUPS);
     printf("Threads/group target : %d\n", THREADS_PER_GROUP);
     printf("CFL numbers          : c*dt/dx=%.4f  c*dt/dy=%.4f\n", CFL_X, CFL_Y);
     printf("Resolution mode      : %s\n", USE_FIXED_DOMAIN ? "fixed domain" : "fixed spacing");
-    printf("Local decomposition  : MPI(Y) + Group(Y) + Thread(X)\n");
+    printf("Local decomposition  : MPI(2D) + Group(Y) + Thread(X)\n");
     printf("Energy diagnostics   : initial + every %d steps + final\n", ENERGY_REPORT_INTERVAL);
     printf("============================================\n");
   }
@@ -1052,17 +1200,25 @@ int main(int argc,char **argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     // if (mpi_rank == r) {
       printf(
-        "[Domain] rank %d/%d node_size=%d global-y=[%d,%d) local_ny=%d halo=%d neighbors(down=%d up=%d) x-update=[1,%d)\n",
+        "[Domain] rank %d/%d node_size=%d proc=(%d,%d)/(%d,%d) global-x=[%d,%d) global-y=[%d,%d) local=(nx=%d,ny=%d) halo=%d neighbors(L=%d R=%d D=%d U=%d)\n",
         mpi_rank,
         mpi_size,
         node_size,
+        g_sim.proc_x,
+        g_sim.proc_y,
+        g_sim.proc_px,
+        g_sim.proc_py,
+        g_sim.local_x_begin,
+        g_sim.local_x_end,
         g_sim.local_y_begin,
         g_sim.local_y_end,
+        g_sim.local_nx,
         g_sim.local_ny,
         HALO,
+        g_sim.neighbor_left,
+        g_sim.neighbor_right,
         g_sim.neighbor_down,
-        g_sim.neighbor_up,
-        NX - 1
+        g_sim.neighbor_up
       );
       // fflush(stdout);
     // }
