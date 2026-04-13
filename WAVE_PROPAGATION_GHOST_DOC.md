@@ -20,7 +20,7 @@ u_tt = c^2 (u_xx + u_yy)
 
 1. `MPI` 采用二维进程网格 `(Px, Py)`，同时切分全局 `X` 与 `Y` 区间（每个 rank 持有一个矩形子域）。
 2. 每个 MPI rank 内部，线程组再次把本地子域切分为二维网格 `(Gx, Gy)`（每个组持有一个矩形 tile）。
-3. 每个组内部，worker 线程沿 `X` 方向在该组 tile 内均分列区间；`Y` 区间在组内共享。
+3. 每个组内部，worker 线程继续把该组 tile 划分为二维网格 `(Tx, Ty)`，每个 worker 持有一个矩形子 tile。
 
 可以把它看成：
 
@@ -28,7 +28,7 @@ u_tt = c^2 (u_xx + u_yy)
 全局网格
   -> MPI rank 拥有一个 (X,Y) 矩形子域
      -> 每个线程组拥有该 rank 的一个 (X,Y) 矩形 tile
-        -> 每个 worker 线程拥有该 tile 中的一段 X（共享同一段 Y）
+        -> 每个 worker 线程拥有该 tile 中的一个更小的 (X,Y) 矩形子 tile
 ```
 
 需要注意的是，`mythread` 中 `NGrpPProc <= 1` 并不表示“只有 1 个组”，而是直接退回非分组模式。因此当前示例同时兼容两种执行方式：
@@ -163,7 +163,7 @@ typedef struct {
 
 主线程在 halo 通信进行时，先让从线程计算内部行；通信完成后，再补算边界行。这样可以把一部分 MPI 等待隐藏到从线程计算里。
 
-非阻塞 halo 通信入口在 [`wave_propagation_ghost.c:325`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L325)。
+非阻塞 halo 通信入口在 [`wave_propagation_ghost.c:486`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L486)。
 
 ### 5.3 通过并行 first-touch 缓解远程内存访问
 
@@ -181,7 +181,7 @@ typedef struct {
 2. 主线程发起专门的“初始化阶段”。
 3. 每个从线程在自己的 tile 上并行写入 `u_prev / u_curr / u_next`。
 
-这样 bulk 页面会优先由负责该 tile 的 worker 触页，更容易落到该组本地内存。初始化核在 [`wave_propagation_ghost.c:327`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L327)。
+这样 bulk 页面会优先由负责该 tile 的 worker 触页，更容易落到该组本地内存。初始化核在 [`wave_propagation_ghost.c:367`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L367)。
 
 ## 6. 时间推进顺序
 
@@ -257,7 +257,7 @@ u_next(y, x) =
 - 全局最上、最下物理边界固定为 0。
 - MPI 之间交换 `X` 与 `Y` 两个方向的 halo。
 
-离散总能量按 tile 分配给 worker，再做组内和全局归约。能量核在 [`wave_propagation_ghost.c:623`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L623)。
+离散总能量按 tile 分配给 worker，再做组内和全局归约。能量核在 [`wave_propagation_ghost.c:663`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L663)。
 
 ## 9. 分辨率与稳定性
 
@@ -286,16 +286,16 @@ u_next(y, x) =
 
 关键位置都在 [`wave_propagation_ghost.c`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c)：
 
-- 并行初始化 first-touch：[`wave_propagation_ghost.c:327`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L327)
-- 进程域初始化与内存分配：[`wave_propagation_ghost.c:296`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L296)
-- 非阻塞 halo 交换：[`wave_propagation_ghost.c:446`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L446)
-- 内部行更新：[`wave_propagation_ghost.c:554`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L554)
-- 边界行更新：[`wave_propagation_ghost.c:579`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L579)
-- 局部能量计算：[`wave_propagation_ghost.c:623`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L623)
-- 任务划分：[`wave_propagation_ghost.c:705`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L705)
-- worker 入口：[`wave_propagation_ghost.c:807`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L807)
-- 组主线程入口：[`wave_propagation_ghost.c:862`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L862)
-- 主线程入口：[`wave_propagation_ghost.c:927`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L927)
+- 并行初始化 first-touch：[`wave_propagation_ghost.c:367`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L367)
+- 进程域初始化与内存分配：[`wave_propagation_ghost.c:336`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L336)
+- 非阻塞 halo 交换：[`wave_propagation_ghost.c:486`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L486)
+- 内部行更新：[`wave_propagation_ghost.c:594`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L594)
+- 边界行更新：[`wave_propagation_ghost.c:619`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L619)
+- 局部能量计算：[`wave_propagation_ghost.c:663`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L663)
+- 任务划分：[`wave_propagation_ghost.c:745`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L745)
+- worker 入口：[`wave_propagation_ghost.c:879`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L879)
+- 组主线程入口：[`wave_propagation_ghost.c:934`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L934)
+- 主线程入口：[`wave_propagation_ghost.c:999`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L999)
 
 ## 11. 编译与运行
 
@@ -328,7 +328,6 @@ mpirun -np 4 ./wave_propagation_ghost
 - 去掉主线程里的 bulk 初值写入，改成 worker 并行初始化。
 - 新增 `init_fields_state()` 阶段，用来统一调度并行 first-touch。
 - 把 `u_prev / u_curr / u_next` 的 bulk 页面尽量 first-touch 到对应 worker 所在组附近。
-- 线程组的任务划分从“只沿 `Y` 切分”更新为“组层二维切分本地 `(X,Y)` 子域”；组内 worker 在该组 tile 内沿 `X` 继续均分。
+- 线程组和 worker 的任务划分现在都基于二维 tile：组层先二维切分本地 `(X,Y)` 子域，组内 worker 再二维切分该组 tile。
 - 保留 `N_GROUPS=1` 时的兼容逻辑，单组退回非分组模式时仍然能走同样的并行初始化。
 - 把 worker 内部的调试计时改成真正只包 `compute_interior_block()`，并在 `DEBUG` 下才输出，避免打印本身继续污染性能测量。
-

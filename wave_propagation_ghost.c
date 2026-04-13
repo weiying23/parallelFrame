@@ -22,7 +22,7 @@
 #define NX 32000
 #endif
 #ifndef NY
-#define NY 8000
+#define NY 32000
 #endif
 #ifndef NT
 #define NT 480
@@ -60,7 +60,7 @@
 #define HALO 1
 #endif
 #ifndef N_GROUPS
-#define N_GROUPS 1
+#define N_GROUPS 4
 #endif
 #ifndef N_WORKERS
 #define N_WORKERS 35
@@ -267,30 +267,70 @@ static void *xcalloc(size_t count,size_t size) {
   return p;
 }
 
-static void choose_process_grid(int mpi_size,int *px,int *py) {
-  int best = 1;
-  int limit = (int)sqrt((double)mpi_size);
+static void choose_2d_grid(int parts,int span_x,int span_y,int *px,int *py) {
+  int best_x = 1;
+  int best_y = 1;
+  int best_penalty = 0;
+  double best_balance = 0.0;
+  int found = 0;
 
-  for (int f = 1; f <= limit; f++) {
-    if ((mpi_size % f) == 0) {
-      best = f;
+  if (parts <= 1) {
+    *px = 1;
+    *py = 1;
+    return;
+  }
+  if (span_x < 1) {
+    span_x = 1;
+  }
+  if (span_y < 1) {
+    span_y = 1;
+  }
+
+  for (int x_parts = 1; x_parts <= parts; x_parts++) {
+    int y_parts;
+    int penalty;
+    double balance;
+
+    if ((parts % x_parts) != 0) {
+      continue;
+    }
+
+    y_parts = parts / x_parts;
+    penalty = 0;
+    if (x_parts > span_x) {
+      penalty += x_parts - span_x;
+    }
+    if (y_parts > span_y) {
+      penalty += y_parts - span_y;
+    }
+
+    balance = fabs((double)span_x * (double)y_parts - (double)span_y * (double)x_parts);
+
+    if (!found ||
+        penalty < best_penalty ||
+        (penalty == best_penalty && balance < best_balance)) {
+      found = 1;
+      best_penalty = penalty;
+      best_balance = balance;
+      best_x = x_parts;
+      best_y = y_parts;
     }
   }
-  *px = best;
-  *py = mpi_size / best;
+
+  *px = best_x;
+  *py = best_y;
+}
+
+static void choose_process_grid(int mpi_size,int *px,int *py) {
+  choose_2d_grid(mpi_size, NX, NY, px, py);
 }
 
 static void choose_group_grid(int groups,int *gx,int *gy) {
-  int best = 1;
-  int limit = (int)sqrt((double)groups);
+  choose_2d_grid(groups, g_sim.local_nx, g_sim.local_ny, gx, gy);
+}
 
-  for (int f = 1; f <= limit; f++) {
-    if ((groups % f) == 0) {
-      best = f;
-    }
-  }
-  *gx = best;
-  *gy = groups / best;
+static void choose_worker_grid(int workers,int span_x,int span_y,int *tx,int *ty) {
+  choose_2d_grid(workers, span_x, span_y, tx, ty);
 }
 
 static void setup_process_domain(int mpi_rank,int mpi_size) {
@@ -714,21 +754,41 @@ static void setup_group_thread_tasks(void) {
     int gx = g % gpx;
     int gy = g / gpx;
     int x_group_begin, x_group_end;
-    int y_begin, y_end;
+    int y_group_begin, y_group_end;
+    int tx = 1;
+    int ty = 1;
 
     split_range(HALO, HALO + g_sim.local_nx, gpx, gx, &x_group_begin, &x_group_end);
-    split_range(HALO, HALO + g_sim.local_ny, gpy, gy, &y_begin, &y_end);
+    split_range(HALO, HALO + g_sim.local_ny, gpy, gy, &y_group_begin, &y_group_end);
+
+    if (worker_count > 0) {
+      choose_worker_grid(
+        worker_count,
+        x_group_end - x_group_begin,
+        y_group_end - y_group_begin,
+        &tx,
+        &ty
+      );
+    }
 
     for (int t = 0; t < pg->Nthreads; t++) {
       THREADINFO *pti = &pg->threads[t];
       ThreadTask *task = (ThreadTask*)pti->td;
       int x_begin, x_end;
+      int y_begin, y_end;
 
       if (t == 0 || worker_count <= 0) {
-        x_begin = HALO;
-        x_end = HALO;
+        x_begin = x_group_begin;
+        x_end = x_group_begin;
+        y_begin = y_group_begin;
+        y_end = y_group_begin;
       } else {
-        split_range(x_group_begin, x_group_end, worker_count, t - 1, &x_begin, &x_end);
+        int worker_id = t - 1;
+        int tx_id = worker_id % tx;
+        int ty_id = worker_id / tx;
+
+        split_range(x_group_begin, x_group_end, tx, tx_id, &x_begin, &x_end);
+        split_range(y_group_begin, y_group_end, ty, ty_id, &y_begin, &y_end);
       }
 
       task->gid = g;
@@ -739,7 +799,7 @@ static void setup_group_thread_tasks(void) {
       task->y_end = y_end;
       reset_task_timers(task);
 
-#ifdef DEBUG
+// #ifdef DEBUG
       printf(
         "[Init] MPI=%d Group=%d/%d Thread=%d role=%s global-x=[%d,%d) global-y=[%d,%d) x=[%d,%d) y=[%d,%d)\n",
         mpi_id,
@@ -749,29 +809,37 @@ static void setup_group_thread_tasks(void) {
         (t == 0) ? "group-main" : "worker",
         global_x_from_local(x_begin),
         global_x_from_local(x_end),
-        g_sim.local_y_begin + (y_begin - HALO),
-        g_sim.local_y_begin + (y_end - HALO),
+        global_y_from_local(y_begin),
+        global_y_from_local(y_end),
         x_begin,
         x_end,
         y_begin,
         y_end
       );
-#endif // DEBUG
+// #endif // DEBUG
     }
   }
 }
 
 static void setup_single_group_tasks(void) {
   int worker_count = md.Nthreads - 1;
-  int y_begin = HALO;
-  int y_end = g_sim.local_ny + HALO;
+  int tx = 1;
+  int ty = 1;
+
+  if (worker_count > 0) {
+    choose_worker_grid(worker_count, g_sim.local_nx, g_sim.local_ny, &tx, &ty);
+  }
 
   for (int t = 0; t < worker_count; t++) {
     THREADINFO *pti = &md.threads[t];
     ThreadTask *task = (ThreadTask*)pti->td;
     int x_begin, x_end;
+    int y_begin, y_end;
+    int tx_id = t % tx;
+    int ty_id = t / tx;
 
-    split_range(HALO, HALO + g_sim.local_nx, worker_count, t, &x_begin, &x_end);
+    split_range(HALO, HALO + g_sim.local_nx, tx, tx_id, &x_begin, &x_end);
+    split_range(HALO, HALO + g_sim.local_ny, ty, ty_id, &y_begin, &y_end);
 
     task->gid = 0;
     task->tid = t;
@@ -783,14 +851,18 @@ static void setup_single_group_tasks(void) {
 
 #ifdef DEBUG
     printf(
-      "[Init] MPI=%d Group=%d Thread=%d role=worker global-y=[%d,%d) x=[%d,%d)\n",
+      "[Init] MPI=%d Group=%d Thread=%d role=worker global-x=[%d,%d) global-y=[%d,%d) x=[%d,%d) y=[%d,%d)\n",
       mpi_id,
       0,
       t,
-      g_sim.local_y_begin,
-      g_sim.local_y_end,
+      global_x_from_local(x_begin),
+      global_x_from_local(x_end),
+      global_y_from_local(y_begin),
+      global_y_from_local(y_end),
       x_begin,
-      x_end
+      x_end,
+      y_begin,
+      y_end
     );
 #endif // DEBUG
   }
@@ -1103,6 +1175,7 @@ static void print_one_task_timing(int mpi_rank,int mpi_size,int node_size,const 
     global_y_end = g_sim.local_y_begin + (task->y_end - HALO);
   }
 
+#ifdef DEBUG
   printf(
     "[Timing] rank %d/%d node_size=%d gid=%d tid=%d role=%s cpu=%d "
     "x=[%d,%d) y=[%d,%d) global-y=[%d,%d) "
@@ -1137,6 +1210,7 @@ static void print_one_task_timing(int mpi_rank,int mpi_size,int node_size,const 
     task ? task->energy_steps : 0,
     total
   );
+#endif
 }
 
 static void print_timing_report(int mpi_rank,int mpi_size,int node_size) {
@@ -1239,7 +1313,7 @@ int main(int argc,char **argv) {
     printf("Threads/group target : %d\n", THREADS_PER_GROUP);
     printf("CFL numbers          : c*dt/dx=%.4f  c*dt/dy=%.4f\n", CFL_X, CFL_Y);
     printf("Resolution mode      : %s\n", USE_FIXED_DOMAIN ? "fixed domain" : "fixed spacing");
-    printf("Local decomposition  : MPI(2D) + Group(Y) + Thread(X)\n");
+    printf("Local decomposition  : MPI(2D) + Group(2D) + Thread(2D)\n");
     printf("Energy diagnostics   : initial + every %d steps + final\n", ENERGY_REPORT_INTERVAL);
     printf("============================================\n");
   }
