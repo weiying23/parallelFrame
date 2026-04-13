@@ -18,19 +18,31 @@
  * 线程只负责计算不重叠的 tile，不再做线程级 ghost 交换。
  */
 
+#ifndef NX
 #define NX 32000
+#endif
+#ifndef NY
 #define NY 8000
+#endif
+#ifndef NT
 #define NT 480
+#endif
 
+#ifndef DT
 #define DT 0.001
+#endif
+#ifndef C0
 #define C0 0.1
+#endif
 
 /*
  * 增大计算量有两种常见方式：
  * 1. USE_FIXED_DOMAIN=1：固定物理区域，增大 NX/NY 表示网格加密、分辨率提高。
  * 2. USE_FIXED_DOMAIN=0：固定 DX/DY，增大 NX/NY 表示物理区域扩大、总网格点增加。
  */
+#ifndef USE_FIXED_DOMAIN
 #define USE_FIXED_DOMAIN 0
+#endif
 
 #if USE_FIXED_DOMAIN
 #define LX 1.0
@@ -44,11 +56,21 @@
 #define LY ((NY - 1) * DY)
 #endif
 
+#ifndef HALO
 #define HALO 1
+#endif
+#ifndef N_GROUPS
 #define N_GROUPS 1
+#endif
+#ifndef N_WORKERS
 #define N_WORKERS 35
+#endif
+#ifndef THREADS_PER_GROUP
 #define THREADS_PER_GROUP (N_WORKERS + 1)
+#endif
+#ifndef ENERGY_REPORT_INTERVAL
 #define ENERGY_REPORT_INTERVAL 60
+#endif
 
 #define DT2 (DT * DT)
 #define CFL_X (C0 * DT / DX)
@@ -256,6 +278,19 @@ static void choose_process_grid(int mpi_size,int *px,int *py) {
   }
   *px = best;
   *py = mpi_size / best;
+}
+
+static void choose_group_grid(int groups,int *gx,int *gy) {
+  int best = 1;
+  int limit = (int)sqrt((double)groups);
+
+  for (int f = 1; f <= limit; f++) {
+    if ((groups % f) == 0) {
+      best = f;
+    }
+  }
+  *gx = best;
+  *gy = groups / best;
 }
 
 static void setup_process_domain(int mpi_rank,int mpi_size) {
@@ -668,12 +703,21 @@ static void swap_fields(void) {
 }
 
 static void setup_group_thread_tasks(void) {
+  int gpx = 1;
+  int gpy = 1;
+
+  choose_group_grid(md.ngrp, &gpx, &gpy);
+
   for (int g = 0; g < md.ngrp; g++) {
     threadGroup *pg = md.grps[g];
     int worker_count = pg->Nthreads - 1;
+    int gx = g % gpx;
+    int gy = g / gpx;
+    int x_group_begin, x_group_end;
     int y_begin, y_end;
 
-    split_range(HALO, g_sim.local_ny + HALO, md.ngrp, g, &y_begin, &y_end);
+    split_range(HALO, HALO + g_sim.local_nx, gpx, gx, &x_group_begin, &x_group_end);
+    split_range(HALO, HALO + g_sim.local_ny, gpy, gy, &y_begin, &y_end);
 
     for (int t = 0; t < pg->Nthreads; t++) {
       THREADINFO *pti = &pg->threads[t];
@@ -684,7 +728,7 @@ static void setup_group_thread_tasks(void) {
         x_begin = HALO;
         x_end = HALO;
       } else {
-        split_range(HALO, HALO + g_sim.local_nx, worker_count, t - 1, &x_begin, &x_end);
+        split_range(x_group_begin, x_group_end, worker_count, t - 1, &x_begin, &x_end);
       }
 
       task->gid = g;
@@ -697,15 +741,20 @@ static void setup_group_thread_tasks(void) {
 
 #ifdef DEBUG
       printf(
-        "[Init] MPI=%d Group=%d Thread=%d role=%s global-y=[%d,%d) x=[%d,%d)\n",
+        "[Init] MPI=%d Group=%d/%d Thread=%d role=%s global-x=[%d,%d) global-y=[%d,%d) x=[%d,%d) y=[%d,%d)\n",
         mpi_id,
         g,
+        md.ngrp,
         t,
         (t == 0) ? "group-main" : "worker",
+        global_x_from_local(x_begin),
+        global_x_from_local(x_end),
         g_sim.local_y_begin + (y_begin - HALO),
         g_sim.local_y_begin + (y_end - HALO),
         x_begin,
-        x_end
+        x_end,
+        y_begin,
+        y_end
       );
 #endif // DEBUG
     }
@@ -1054,40 +1103,40 @@ static void print_one_task_timing(int mpi_rank,int mpi_size,int node_size,const 
     global_y_end = g_sim.local_y_begin + (task->y_end - HALO);
   }
 
-  // printf(
-    // "[Timing] rank %d/%d node_size=%d gid=%d tid=%d role=%s cpu=%d "
-    // "x=[%d,%d) y=[%d,%d) global-y=[%d,%d) "
-    // "wait(init=%.6f energy0=%.6f compute=%.6f boundary=%.6f energy=%.6f) "
-    // "work(init=%.6f energy0=%.6f compute=%.6f boundary=%.6f energy=%.6f) "
-    // "comm=%.6f allreduce=%.6f energy_steps=%d total=%.6f\n",
-    // mpi_rank,
-    // mpi_size,
-    // node_size,
-    // task ? task->gid : -999,
-    // task ? task->tid : -999,
-    // task_role_name(task),
-    // task ? task->cpu_id : -1,
-    // task ? task->x_begin : 0,
-    // task ? task->x_end : 0,
-    // task ? task->y_begin : 0,
-    // task ? task->y_end : 0,
-    // global_y_begin,
-    // global_y_end,
-    // task ? task->t_wait_init : 0.0,
-    // task ? task->t_wait_energy0 : 0.0,
-    // task ? task->t_wait_compute : 0.0,
-    // task ? task->t_wait_boundary : 0.0,
-    // task ? task->t_wait_energy : 0.0,
-    // task ? task->t_work_init : 0.0,
-    // task ? task->t_work_energy0 : 0.0,
-    // task ? task->t_work_compute : 0.0,
-    // task ? task->t_work_boundary : 0.0,
-    // task ? task->t_work_energy : 0.0,
-    // task ? task->t_comm : 0.0,
-    // task ? task->t_allreduce : 0.0,
-    // task ? task->energy_steps : 0,
-    // total
-  // );
+  printf(
+    "[Timing] rank %d/%d node_size=%d gid=%d tid=%d role=%s cpu=%d "
+    "x=[%d,%d) y=[%d,%d) global-y=[%d,%d) "
+    "wait(init=%.6f energy0=%.6f compute=%.6f boundary=%.6f energy=%.6f) "
+    "work(init=%.6f energy0=%.6f compute=%.6f boundary=%.6f energy=%.6f) "
+    "comm=%.6f allreduce=%.6f energy_steps=%d total=%.6f\n",
+    mpi_rank,
+    mpi_size,
+    node_size,
+    task ? task->gid : -999,
+    task ? task->tid : -999,
+    task_role_name(task),
+    task ? task->cpu_id : -1,
+    task ? task->x_begin : 0,
+    task ? task->x_end : 0,
+    task ? task->y_begin : 0,
+    task ? task->y_end : 0,
+    global_y_begin,
+    global_y_end,
+    task ? task->t_wait_init : 0.0,
+    task ? task->t_wait_energy0 : 0.0,
+    task ? task->t_wait_compute : 0.0,
+    task ? task->t_wait_boundary : 0.0,
+    task ? task->t_wait_energy : 0.0,
+    task ? task->t_work_init : 0.0,
+    task ? task->t_work_energy0 : 0.0,
+    task ? task->t_work_compute : 0.0,
+    task ? task->t_work_boundary : 0.0,
+    task ? task->t_work_energy : 0.0,
+    task ? task->t_comm : 0.0,
+    task ? task->t_allreduce : 0.0,
+    task ? task->energy_steps : 0,
+    total
+  );
 }
 
 static void print_timing_report(int mpi_rank,int mpi_size,int node_size) {

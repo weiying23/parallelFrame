@@ -16,19 +16,19 @@ u_tt = c^2 (u_xx + u_yy)
 
 ## 2. 并行结构
 
-整体分解仍然是三层：
+整体分解是三层：
 
-1. `MPI` 沿 `Y` 方向切分全局网格。
-2. 每个 MPI 进程内部，线程组继续沿本地 `Y` 方向切分。
-3. 每个组内部，从线程沿 `X` 方向切分计算区间。
+1. `MPI` 采用二维进程网格 `(Px, Py)`，同时切分全局 `X` 与 `Y` 区间（每个 rank 持有一个矩形子域）。
+2. 每个 MPI rank 内部，线程组再次把本地子域切分为二维网格 `(Gx, Gy)`（每个组持有一个矩形 tile）。
+3. 每个组内部，worker 线程沿 `X` 方向在该组 tile 内均分列区间；`Y` 区间在组内共享。
 
 可以把它看成：
 
 ```text
 全局网格
-  -> MPI rank 拥有一个 Y 子区间
-     -> 每个线程组拥有该 rank 的一段本地 Y
-        -> 每个从线程拥有该组中的一段 X
+  -> MPI rank 拥有一个 (X,Y) 矩形子域
+     -> 每个线程组拥有该 rank 的一个 (X,Y) 矩形 tile
+        -> 每个 worker 线程拥有该 tile 中的一段 X（共享同一段 Y）
 ```
 
 需要注意的是，`mythread` 中 `NGrpPProc <= 1` 并不表示“只有 1 个组”，而是直接退回非分组模式。因此当前示例同时兼容两种执行方式：
@@ -36,7 +36,7 @@ u_tt = c^2 (u_xx + u_yy)
 - `ThreadG != 0`：分组模式，使用 `mSetGrps / gWaitMain / sWaitGrp` 这套接口。
 - `ThreadG == 0`：非分组模式，退回 `mSetSubs / sWaitState` 这套接口。
 
-兼容入口在 [`wave_propagation_ghost.c:143`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L143)。
+兼容入口在 [`wave_propagation_ghost.c:221`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L221)。
 
 ## 3. 主要数据结构
 
@@ -49,11 +49,20 @@ typedef struct {
   double *u_prev;
   double *u_curr;
   double *u_next;
+  int local_x_begin;
+  int local_x_end;
+  int local_nx;
   int local_y_begin;
   int local_y_end;
   int local_ny;
   int mpi_rank;
   int mpi_size;
+  int proc_x;
+  int proc_y;
+  int proc_px;
+  int proc_py;
+  int neighbor_left;
+  int neighbor_right;
   int neighbor_up;
   int neighbor_down;
   double initial_energy;
@@ -63,11 +72,13 @@ typedef struct {
 含义：
 
 - `u_prev / u_curr / u_next`：当前 MPI 进程共享的三个时间层。
+- `local_x_begin / local_x_end`：本 rank 负责的全局 `X` 区间。
 - `local_y_begin / local_y_end`：本 rank 负责的全局 `Y` 区间。
-- `local_ny`：本地真实物理行数。
-- `neighbor_up / neighbor_down`：上下相邻 MPI rank。
+- `local_nx / local_ny`：本地真实物理列/行数。
+- `proc_(x,y) / proc_(px,py)`：MPI 二维进程网格与本 rank 的网格坐标。
+- `neighbor_left/right/up/down`：四个方向相邻 MPI rank（用于 halo 交换）。
 
-局部数组带上下两行 halo，所以实际分配行数是 `local_ny + 2`。
+局部数组四周都有 halo，因此实际分配尺寸是 `(local_ny + 2*HALO) x (local_nx + 2*HALO)`。
 
 ### 3.2 `ThreadTask`
 
@@ -170,7 +181,7 @@ typedef struct {
 2. 主线程发起专门的“初始化阶段”。
 3. 每个从线程在自己的 tile 上并行写入 `u_prev / u_curr / u_next`。
 
-这样 bulk 页面会优先由负责该 tile 的 worker 触页，更容易落到该组本地内存。初始化核在 [`wave_propagation_ghost.c:209`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L209)。
+这样 bulk 页面会优先由负责该 tile 的 worker 触页，更容易落到该组本地内存。初始化核在 [`wave_propagation_ghost.c:327`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L327)。
 
 ## 6. 时间推进顺序
 
@@ -221,11 +232,11 @@ energy_phase_state(step) = 3 * step + 5
 
 这些入口分别在：
 
-- [`wave_propagation_ghost.c:116`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L116)
-- [`wave_propagation_ghost.c:120`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L120)
-- [`wave_propagation_ghost.c:124`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L124)
-- [`wave_propagation_ghost.c:128`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L128)
-- [`wave_propagation_ghost.c:147`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L147)
+- [`wave_propagation_ghost.c:225`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L225)
+- [`wave_propagation_ghost.c:194`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L194)
+- [`wave_propagation_ghost.c:198`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L198)
+- [`wave_propagation_ghost.c:202`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L202)
+- [`wave_propagation_ghost.c:206`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L206)
 
 ## 8. 数值更新与能量
 
@@ -244,9 +255,9 @@ u_next(y, x) =
 
 - 左右边界固定为 0。
 - 全局最上、最下物理边界固定为 0。
-- MPI 之间只交换 `Y` 向 halo。
+- MPI 之间交换 `X` 与 `Y` 两个方向的 halo。
 
-离散总能量按 tile 分配给 worker，再做组内和全局归约。能量核在 [`wave_propagation_ghost.c:419`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L419)。
+离散总能量按 tile 分配给 worker，再做组内和全局归约。能量核在 [`wave_propagation_ghost.c:623`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L623)。
 
 ## 9. 分辨率与稳定性
 
@@ -275,16 +286,16 @@ u_next(y, x) =
 
 关键位置都在 [`wave_propagation_ghost.c`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c)：
 
-- 并行初始化 first-touch：[`wave_propagation_ghost.c:209`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L209)
-- 进程域初始化与内存分配：[`wave_propagation_ghost.c:227`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L227)
-- 非阻塞 halo 交换：[`wave_propagation_ghost.c:325`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L325)
-- 内部行更新：[`wave_propagation_ghost.c:389`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L389)
-- 边界行更新：[`wave_propagation_ghost.c:404`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L404)
-- 局部能量计算：[`wave_propagation_ghost.c:419`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L419)
-- 任务划分：[`wave_propagation_ghost.c:578`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L578)
-- worker 入口：[`wave_propagation_ghost.c:586`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L586)
-- 组主线程入口：[`wave_propagation_ghost.c:631`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L631)
-- 主线程入口：[`wave_propagation_ghost.c:668`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L668)
+- 并行初始化 first-touch：[`wave_propagation_ghost.c:327`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L327)
+- 进程域初始化与内存分配：[`wave_propagation_ghost.c:296`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L296)
+- 非阻塞 halo 交换：[`wave_propagation_ghost.c:446`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L446)
+- 内部行更新：[`wave_propagation_ghost.c:554`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L554)
+- 边界行更新：[`wave_propagation_ghost.c:579`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L579)
+- 局部能量计算：[`wave_propagation_ghost.c:623`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L623)
+- 任务划分：[`wave_propagation_ghost.c:705`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L705)
+- worker 入口：[`wave_propagation_ghost.c:807`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L807)
+- 组主线程入口：[`wave_propagation_ghost.c:862`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L862)
+- 主线程入口：[`wave_propagation_ghost.c:927`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L927)
 
 ## 11. 编译与运行
 
@@ -295,6 +306,13 @@ mpicc -Wall -O2 -o wave_propagation_ghost \
     wave_propagation_ghost.c \
     mythread/mythread.c \
     -lpthread -lm
+```
+
+如需做小规模快速验证或调参，可以在编译时用 `-D` 覆盖默认宏，例如：
+
+```bash
+mpicc -Wall -O2 -DNX=256 -DNY=128 -DNT=10 -DN_GROUPS=4 -DN_WORKERS=8 \
+    -o wave_propagation_ghost_small wave_propagation_ghost.c mythread/mythread.c -lpthread -lm
 ```
 
 ### 11.2 运行
@@ -310,5 +328,7 @@ mpirun -np 4 ./wave_propagation_ghost
 - 去掉主线程里的 bulk 初值写入，改成 worker 并行初始化。
 - 新增 `init_fields_state()` 阶段，用来统一调度并行 first-touch。
 - 把 `u_prev / u_curr / u_next` 的 bulk 页面尽量 first-touch 到对应 worker 所在组附近。
+- 线程组的任务划分从“只沿 `Y` 切分”更新为“组层二维切分本地 `(X,Y)` 子域”；组内 worker 在该组 tile 内沿 `X` 继续均分。
 - 保留 `N_GROUPS=1` 时的兼容逻辑，单组退回非分组模式时仍然能走同样的并行初始化。
 - 把 worker 内部的调试计时改成真正只包 `compute_interior_block()`，并在 `DEBUG` 下才输出，避免打印本身继续污染性能测量。
+
