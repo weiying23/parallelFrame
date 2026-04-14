@@ -627,13 +627,13 @@ static void begin_halo_exchange_for(double *field,MPI_Request requests[8],int *r
 
   if (g_sim.neighbor_up >= 0) {
     memcpy(g_send_up, &field[idx(g_sim.local_ny, HALO)], (size_t)g_sim.local_nx * sizeof(double));
-    MPI_Irecv(g_recv_up, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_up, 101, MPI_COMM_WORLD, &requests[count++]);
+    // MPI_Irecv(g_recv_up, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_up, 101, MPI_COMM_WORLD, &requests[count++]);
     MPI_Isend(g_send_up, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_up, 100, MPI_COMM_WORLD, &requests[count++]);
   }
 
   if (g_sim.neighbor_down >= 0) {
     memcpy(g_send_down, &field[idx(HALO, HALO)], (size_t)g_sim.local_nx * sizeof(double));
-    MPI_Irecv(g_recv_down, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_down, 100, MPI_COMM_WORLD, &requests[count++]);
+    // MPI_Irecv(g_recv_down, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_down, 100, MPI_COMM_WORLD, &requests[count++]);
     MPI_Isend(g_send_down, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_down, 101, MPI_COMM_WORLD, &requests[count++]);
   }
 
@@ -642,7 +642,7 @@ static void begin_halo_exchange_for(double *field,MPI_Request requests[8],int *r
     for (int y = 0; y < height; y++) {
       g_send_left[y] = field[idx(y, x_send)];
     }
-    MPI_Irecv(g_recv_left, height, MPI_DOUBLE, g_sim.neighbor_left, 200, MPI_COMM_WORLD, &requests[count++]);
+    // MPI_Irecv(g_recv_left, height, MPI_DOUBLE, g_sim.neighbor_left, 200, MPI_COMM_WORLD, &requests[count++]);
     MPI_Isend(g_send_left, height, MPI_DOUBLE, g_sim.neighbor_left, 201, MPI_COMM_WORLD, &requests[count++]);
   }
 
@@ -651,7 +651,7 @@ static void begin_halo_exchange_for(double *field,MPI_Request requests[8],int *r
     for (int y = 0; y < height; y++) {
       g_send_right[y] = field[idx(y, x_send)];
     }
-    MPI_Irecv(g_recv_right, height, MPI_DOUBLE, g_sim.neighbor_right, 201, MPI_COMM_WORLD, &requests[count++]);
+    // MPI_Irecv(g_recv_right, height, MPI_DOUBLE, g_sim.neighbor_right, 201, MPI_COMM_WORLD, &requests[count++]);
     MPI_Isend(g_send_right, height, MPI_DOUBLE, g_sim.neighbor_right, 200, MPI_COMM_WORLD, &requests[count++]);
   }
 
@@ -666,14 +666,17 @@ static void end_halo_exchange_for(double *field,MPI_Request requests[8],int requ
   }
 
   if (g_sim.neighbor_up >= 0) {
+    MPI_Recv(g_recv_up, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_up, 101, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     memcpy(&field[idx(g_sim.local_ny + HALO, HALO)], g_recv_up, (size_t)g_sim.local_nx * sizeof(double));
   }
 
   if (g_sim.neighbor_down >= 0) {
+    MPI_Recv(g_recv_down, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_down, 100, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     memcpy(&field[idx(0, HALO)], g_recv_down, (size_t)g_sim.local_nx * sizeof(double));
   }
 
   if (g_sim.neighbor_left >= 0) {
+    MPI_Recv(g_recv_left, height, MPI_DOUBLE, g_sim.neighbor_left, 200, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     int x_recv = 0;
     for (int y = 0; y < height; y++) {
       field[idx(y, x_recv)] = g_recv_left[y];
@@ -681,6 +684,7 @@ static void end_halo_exchange_for(double *field,MPI_Request requests[8],int requ
   }
 
   if (g_sim.neighbor_right >= 0) {
+    MPI_Recv(g_recv_right, height, MPI_DOUBLE, g_sim.neighbor_right, 201, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     int x_recv = HALO + g_sim.local_nx;
     for (int y = 0; y < height; y++) {
       field[idx(y, x_recv)] = g_recv_right[y];
