@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__)
+#include <sys/sysinfo.h>
+#endif
 
 #include "mythread/mythread.h"
 
@@ -19,10 +22,10 @@
  */
 
 #ifndef NX
-#define NX 32000
+#define NX 140000
 #endif
 #ifndef NY
-#define NY 32000
+#define NY 140000
 #endif
 #ifndef NT
 #define NT 480
@@ -60,7 +63,7 @@
 #define HALO 1
 #endif
 #ifndef N_GROUPS
-#define N_GROUPS 4
+#define N_GROUPS 16
 #endif
 #ifndef N_WORKERS
 #define N_WORKERS 35
@@ -143,8 +146,8 @@ int _getgdsize_() {
   return 0;
 }
 
-static inline int idx(int y, int x) {
-  return y * (g_sim.local_nx + 2 * HALO) + x;
+static inline size_t idx(int y, int x) {
+  return (size_t)y * ((size_t)g_sim.local_nx + 2u * (size_t)HALO) + (size_t)x;
 }
 
 static inline int global_x_from_local(int local_x) {
@@ -261,10 +264,142 @@ static void finish_phase_from_worker(int state) {
 static void *xcalloc(size_t count,size_t size) {
   void *p = calloc(count,size);
   if (!p) {
-    fprintf(stderr,"[Error] MPI=%d: allocation failed (%zu x %zu)\n", g_sim.mpi_rank, count, size);
+    double gib = ((double)count * (double)size) / (1024.0 * 1024.0 * 1024.0);
+    fprintf(
+      stderr,
+      "[Error] MPI=%d: allocation failed (%zu x %zu, %.3f GiB)\n",
+      g_sim.mpi_rank,
+      count,
+      size,
+      gib
+    );
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
   return p;
+}
+
+static int add_size_checked(size_t a,size_t b,size_t *out) {
+  if (a > SIZE_MAX - b) {
+    return 0;
+  }
+  *out = a + b;
+  return 1;
+}
+
+static int multiply_size_checked(size_t a,size_t b,size_t *out) {
+  if (a != 0 && b > SIZE_MAX / a) {
+    return 0;
+  }
+  *out = a * b;
+  return 1;
+}
+
+static int estimate_rank_memory_bytes(size_t *plane_elems,size_t *rank_bytes) {
+  size_t field_width;
+  size_t field_height;
+  size_t field_bytes;
+  size_t field_total_bytes;
+  size_t x_buffer_bytes;
+  size_t y_buffer_bytes;
+  size_t x_total_bytes;
+  size_t y_total_bytes;
+  size_t total_bytes;
+
+  if (!add_size_checked((size_t)g_sim.local_nx, 2u * (size_t)HALO, &field_width)) {
+    return 0;
+  }
+  if (!add_size_checked((size_t)g_sim.local_ny, 2u * (size_t)HALO, &field_height)) {
+    return 0;
+  }
+  if (!multiply_size_checked(field_height, field_width, plane_elems)) {
+    return 0;
+  }
+  if (!multiply_size_checked(*plane_elems, sizeof(double), &field_bytes)) {
+    return 0;
+  }
+  if (!multiply_size_checked(field_bytes, 3u, &field_total_bytes)) {
+    return 0;
+  }
+  if (!multiply_size_checked((size_t)g_sim.local_nx, sizeof(double), &x_buffer_bytes)) {
+    return 0;
+  }
+  if (!multiply_size_checked(field_height, sizeof(double), &y_buffer_bytes)) {
+    return 0;
+  }
+  if (!multiply_size_checked(x_buffer_bytes, 4u, &x_total_bytes)) {
+    return 0;
+  }
+  if (!multiply_size_checked(y_buffer_bytes, 4u, &y_total_bytes)) {
+    return 0;
+  }
+  if (!add_size_checked(field_total_bytes, x_total_bytes, &total_bytes)) {
+    return 0;
+  }
+  if (!add_size_checked(total_bytes, y_total_bytes, rank_bytes)) {
+    return 0;
+  }
+  return 1;
+}
+
+static int validate_memory_requirements(int mpi_rank,int node_size) {
+  size_t plane_elems;
+  size_t rank_bytes;
+  size_t node_bytes;
+
+  if (!estimate_rank_memory_bytes(&plane_elems, &rank_bytes)) {
+    if (mpi_rank == 0) {
+      fprintf(stderr, "[Error] local field size overflows size_t while estimating memory usage\n");
+    }
+    return 0;
+  }
+
+  if (node_size < 1) {
+    node_size = 1;
+  }
+  if (!multiply_size_checked(rank_bytes, (size_t)node_size, &node_bytes)) {
+    if (mpi_rank == 0) {
+      fprintf(stderr, "[Error] node-local memory estimate overflowed size_t\n");
+    }
+    return 0;
+  }
+
+  if (mpi_rank == 0) {
+    printf("Estimated rank memory: %.3f GiB\n", (double)rank_bytes / (1024.0 * 1024.0 * 1024.0));
+    printf(
+      "Estimated node memory: %.3f GiB (%d ranks/node)\n",
+      (double)node_bytes / (1024.0 * 1024.0 * 1024.0),
+      node_size
+    );
+  }
+
+#if defined(__linux__)
+  {
+    struct sysinfo info;
+    if (sysinfo(&info) == 0) {
+      unsigned long long visible_bytes = (unsigned long long)info.totalram * (unsigned long long)info.mem_unit;
+
+      if (mpi_rank == 0) {
+        printf(
+          "Visible node memory : %.3f GiB\n",
+          (double)visible_bytes / (1024.0 * 1024.0 * 1024.0)
+        );
+      }
+      if ((unsigned long long)node_bytes > visible_bytes) {
+        if (mpi_rank == 0) {
+          fprintf(
+            stderr,
+            "[Error] estimated node-local memory %.3f GiB exceeds visible node memory %.3f GiB; reduce NX/NY or increase node count\n",
+            (double)node_bytes / (1024.0 * 1024.0 * 1024.0),
+            (double)visible_bytes / (1024.0 * 1024.0 * 1024.0)
+          );
+        }
+        return 0;
+      }
+    }
+  }
+#endif
+
+  return 1;
 }
 
 static void choose_2d_grid(int parts,int span_x,int span_y,int *px,int *py) {
@@ -370,7 +505,7 @@ static void initialize_field_block(const ThreadTask *task) {
 
     for (int x = task->x_begin; x < task->x_end; x++) {
       int global_x = global_x_from_local(x);
-      int p = idx(y, x);
+      size_t p = idx(y, x);
       double value = 0.0;
 
       if (global_x != 0 && global_x != NX - 1 && global_y != 0 && global_y != NY - 1) {
@@ -799,7 +934,7 @@ static void setup_group_thread_tasks(void) {
       task->y_end = y_end;
       reset_task_timers(task);
 
-// #ifdef DEBUG
+#ifdef DEBUG
       printf(
         "[Init] MPI=%d Group=%d/%d Thread=%d role=%s global-x=[%d,%d) global-y=[%d,%d) x=[%d,%d) y=[%d,%d)\n",
         mpi_id,
@@ -816,7 +951,7 @@ static void setup_group_thread_tasks(void) {
         y_begin,
         y_end
       );
-// #endif // DEBUG
+#endif // DEBUG
     }
   }
 }
@@ -1112,6 +1247,9 @@ static void main_thread(void) {
     double elapsed = MPI_Wtime() - start_time;
     double points = (double)NX * (double)NY * (double)NT;
     printf("[Main] Simulation completed in %.3f seconds\n", elapsed);
+    printf("[Main] comm time: %.3f, compute time: %.3f, boundary time: %.3f\n", 
+            task->t_comm, task->t_wait_compute, task->t_wait_boundary);
+    printf("[Main] comm package, localx %d , localy+HALO %d\n", g_sim.local_nx, g_sim.local_ny+HALO);
     printf("[Main] Throughput: %.2f Mpoint-updates/s\n", points / elapsed / 1.0e6);
   }
 }
@@ -1247,6 +1385,8 @@ int main(int argc,char **argv) {
   int NGrpPProc = N_GROUPS;
   int NProcPNode = 16;
   int ManageCoreId = 36;
+  int local_ready = 1;
+  int global_ready = 1;
   int err;
 
   MPI_Init(&argc, &argv);
@@ -1294,6 +1434,13 @@ int main(int argc,char **argv) {
       g_sim.local_nx,
       g_sim.local_ny
     );
+    local_ready = 0;
+  }
+  if (local_ready && !validate_memory_requirements(mpi_rank, node_size)) {
+    local_ready = 0;
+  }
+  MPI_Allreduce(&local_ready, &global_ready, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  if (!global_ready) {
     free_simulation();
     MPI_Finalize();
     return 1;
