@@ -63,7 +63,7 @@
 #define HALO 1
 #endif
 #ifndef N_GROUPS
-#define N_GROUPS 16
+#define N_GROUPS 8
 #endif
 #ifndef N_WORKERS
 #define N_WORKERS 35
@@ -123,6 +123,8 @@ typedef struct {
   double t_wait_energy;
   double t_work_energy;
   double t_comm;
+  double t_recv;
+  double t_waitr;
   double t_allreduce;
   int energy_steps;
 } ThreadTask;
@@ -179,6 +181,8 @@ static void reset_task_timers(ThreadTask *task) {
   task->t_wait_energy = 0.0;
   task->t_work_energy = 0.0;
   task->t_comm = 0.0;
+  task->t_recv = 0.0;
+  task->t_waitr = 0.0;
   task->t_allreduce = 0.0;
   task->energy_steps = 0;
 }
@@ -658,25 +662,27 @@ static void begin_halo_exchange_for(double *field,MPI_Request requests[8],int *r
   *request_count = count;
 }
 
-static void end_halo_exchange_for(double *field,MPI_Request requests[8],int request_count) {
+static void end_halo_exchange_for(double *field,MPI_Request requests[8],int request_count, ThreadTask *task) {
   int height = g_sim.local_ny + 2 * HALO;
-
-  if (request_count > 0) {
-    MPI_Waitall(request_count, requests, MPI_STATUSES_IGNORE);
-  }
-
+  double tc;
   if (g_sim.neighbor_up >= 0) {
+    tc = wall_time();
     MPI_Recv(g_recv_up, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_up, 101, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    task->t_recv += wall_time() - tc;
     memcpy(&field[idx(g_sim.local_ny + HALO, HALO)], g_recv_up, (size_t)g_sim.local_nx * sizeof(double));
   }
 
   if (g_sim.neighbor_down >= 0) {
+    tc = wall_time();
     MPI_Recv(g_recv_down, g_sim.local_nx, MPI_DOUBLE, g_sim.neighbor_down, 100, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    task->t_recv += wall_time() - tc;
     memcpy(&field[idx(0, HALO)], g_recv_down, (size_t)g_sim.local_nx * sizeof(double));
   }
 
   if (g_sim.neighbor_left >= 0) {
+    tc = wall_time();
     MPI_Recv(g_recv_left, height, MPI_DOUBLE, g_sim.neighbor_left, 200, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    task->t_recv += wall_time() - tc;
     int x_recv = 0;
     for (int y = 0; y < height; y++) {
       field[idx(y, x_recv)] = g_recv_left[y];
@@ -684,23 +690,31 @@ static void end_halo_exchange_for(double *field,MPI_Request requests[8],int requ
   }
 
   if (g_sim.neighbor_right >= 0) {
+    tc = wall_time();
     MPI_Recv(g_recv_right, height, MPI_DOUBLE, g_sim.neighbor_right, 201, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    task->t_recv += wall_time() - tc;
     int x_recv = HALO + g_sim.local_nx;
     for (int y = 0; y < height; y++) {
       field[idx(y, x_recv)] = g_recv_right[y];
     }
   }
 
+  tc = wall_time();
+  if (request_count > 0) {
+    MPI_Waitall(request_count, requests, MPI_STATUSES_IGNORE);
+  }
+  task->t_waitr += wall_time() - tc;
+
   enforce_dirichlet_boundaries(field);
   zero_physical_y_boundaries(field);
 }
 
-static void exchange_halos_for(double *field) {
+static void exchange_halos_for(double *field, ThreadTask *task) {
   MPI_Request requests[8];
   int request_count = 0;
 
   begin_halo_exchange_for(field, requests, &request_count);
-  end_halo_exchange_for(field, requests, request_count);
+  end_halo_exchange_for(field, requests, request_count, task);
 }
 
 static void compute_block_region(const ThreadTask *task,int y_begin,int y_end,int x_begin,int x_end) {
@@ -1102,10 +1116,12 @@ static void group_main_thread(void) {
 
     t0 = wall_time();
     gWaitMain(compute_state);
-    task->t_wait_compute += wall_time() - t0;
+    double t1 = wall_time();
+    task->t_wait_compute += t1 - t0;
     gSetSubs(compute_state);
     t0 = wall_time();
     gWaitSubs(compute_state);
+    task->t_recv += wall_time() - t1;
     task->t_wait_compute += wall_time() - t0;
     gSetMain(compute_state);
 
@@ -1133,6 +1149,7 @@ static void group_main_thread(void) {
       gSetMain(energy_state);
     }
   }
+  printf("Group-Summary%d-%d: %.3f %.3f\n",mpi_id, ti->igrp, task->t_wait_compute, task->t_recv);
 }
 
 static void main_thread(void) {
@@ -1151,8 +1168,8 @@ static void main_thread(void) {
   task->t_wait_init += wall_time() - t0;
 
   t0 = wall_time();
-  exchange_halos_for(g_sim.u_curr);
-  exchange_halos_for(g_sim.u_prev);
+  exchange_halos_for(g_sim.u_curr, task);
+  exchange_halos_for(g_sim.u_prev, task);
   task->t_comm += wall_time() - t0;
 
   t0 = wall_time();
@@ -1175,6 +1192,7 @@ static void main_thread(void) {
   double prev_time = start_time;
 
   for (int step = 0; step < NT; step++) {
+    MPI_Barrier(MPI_COMM_WORLD);
     int compute_state = compute_phase_state(step);
     int boundary_state = boundary_phase_state(step);
     int energy_state = energy_phase_state(step);
@@ -1182,23 +1200,17 @@ static void main_thread(void) {
     MPI_Request requests[8];
     int request_count = 0;
 
-    if (!current_halo_ready) {
-      t0 = wall_time();
-      begin_halo_exchange_for(g_sim.u_curr, requests, &request_count);
-      task->t_comm += wall_time() - t0;
-    }
-
     t0 = wall_time();
     start_phase_from_main(compute_state);
-    wait_phase_from_main(compute_state);
-    task->t_wait_compute += wall_time() - t0;
-
     if (!current_halo_ready) {
-      t0 = wall_time();
-      end_halo_exchange_for(g_sim.u_curr, requests, request_count);
-      task->t_comm += wall_time() - t0;
+      double t1 = wall_time();
+      begin_halo_exchange_for(g_sim.u_curr, requests, &request_count);
+      end_halo_exchange_for(g_sim.u_curr, requests, request_count, task);
+      task->t_comm += wall_time() - t1;
       current_halo_ready = 1;
     }
+    wait_phase_from_main(compute_state);
+    task->t_wait_compute += wall_time() - t0;
 
     t0 = wall_time();
     start_phase_from_main(boundary_state);
@@ -1211,7 +1223,7 @@ static void main_thread(void) {
     if (need_energy) {
       t0 = wall_time();
       begin_halo_exchange_for(g_sim.u_curr, requests, &request_count);
-      end_halo_exchange_for(g_sim.u_curr, requests, request_count);
+      end_halo_exchange_for(g_sim.u_curr, requests, request_count,task);
       task->t_comm += wall_time() - t0;
       current_halo_ready = 1;
 
@@ -1247,15 +1259,17 @@ static void main_thread(void) {
     }
   }
 
-  if (mpi_id == 0) {
     double elapsed = MPI_Wtime() - start_time;
+  if (mpi_id == 0) {
     double points = (double)NX * (double)NY * (double)NT;
     printf("[Main] Simulation completed in %.3f seconds\n", elapsed);
-    printf("[Main] comm time: %.3f, compute time: %.3f, boundary time: %.3f\n", 
-            task->t_comm, task->t_wait_compute, task->t_wait_boundary);
+    printf("[Main] comm time: %.3f, recv tiem: %.3f, wait recv: %.3f, compute time: %.3f, boundary time: %.3f\n", 
+            task->t_comm, task->t_recv, task->t_waitr, task->t_wait_compute, task->t_wait_boundary);
     printf("[Main] comm package, localx %d , localy+HALO %d\n", g_sim.local_nx, g_sim.local_ny+HALO);
     printf("[Main] Throughput: %.2f Mpoint-updates/s\n", points / elapsed / 1.0e6);
   }
+  printf("Main-summary-%d: %d %d %.3f %.3f %.3f %.3f %.3f %.3f\n",mpi_id, g_sim.local_nx, g_sim.local_ny+HALO,
+         elapsed,task->t_comm, task->t_recv, task->t_waitr, task->t_wait_compute, task->t_wait_boundary);
 }
 
 void thread_run(void) {
@@ -1348,6 +1362,8 @@ static void print_one_task_timing(int mpi_rank,int mpi_size,int node_size,const 
     task ? task->t_work_boundary : 0.0,
     task ? task->t_work_energy : 0.0,
     task ? task->t_comm : 0.0,
+    task ? task->t_recv : 0.0,
+    task ? task->t_waitr : 0.0,
     task ? task->t_allreduce : 0.0,
     task ? task->energy_steps : 0,
     total
@@ -1359,7 +1375,7 @@ static void print_timing_report(int mpi_rank,int mpi_size,int node_size) {
   for (int r = 0; r < mpi_size; r++) {
     MPI_Barrier(MPI_COMM_WORLD);
     if (mpi_rank == r) {
-      printf("========== Timing Report rank %d/%d ==========\n", mpi_rank, mpi_size);
+      // printf("========== Timing Report rank %d/%d ==========\n", mpi_rank, mpi_size);
       print_one_task_timing(mpi_rank, mpi_size, node_size, (ThreadTask*)md.tm.td);
       if (uses_group_threads()) {
         for (int g = 0; g < md.ngrp; g++) {
