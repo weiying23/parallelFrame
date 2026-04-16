@@ -31,6 +31,10 @@
 #define NT 480
 #endif
 
+#ifndef A
+#define A 10.0
+#endif
+
 #ifndef DT
 #define DT 0.001
 #endif
@@ -500,7 +504,7 @@ static double initial_condition_value(int global_y,int global_x) {
   double dx = global_x * DX - cx;
   double dy = global_y * DY - cy;
 
-  return exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma));
+  return A * exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma));
 }
 
 static void initialize_field_block(const ThreadTask *task) {
