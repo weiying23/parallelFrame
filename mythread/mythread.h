@@ -139,6 +139,26 @@ void prtsc_();
 // Fortran 接口使用的默认线程函数（可覆盖）
 void thread_run(void);
 
+typedef void (*mt_task_fn)(void *ctx);
+typedef struct {
+  mt_task_fn fn;
+  void *ctx;
+} mt_task;
+typedef struct _mt_taskpool mt_taskpool;
+
+#define MT_TASKPOOL_BLOCK 1
+#define MT_TASKPOOL_SPIN  2
+#define MT_TASKPOOL_TRY   4
+
+int mt_taskpool_attach(int slot,int capacity,int flags);
+int mt_taskpool_detach(int slot);
+int mt_taskpool_begin(int slot);
+int mt_taskpool_submit(int slot,mt_task_fn fn,void *ctx);
+int mt_taskpool_close(int slot);
+int mt_taskpool_wait(int slot);
+int mt_taskpool_shutdown(int slot);
+int mt_taskpool_worker_loop(int slot);
+
 //sync function
 //SG
 void sWaitGrp(int state);

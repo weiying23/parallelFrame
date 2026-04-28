@@ -145,6 +145,35 @@
 
 ---
 
+## 6.1 任务队列线程池（组内）
+
+| 函数名 | 参数 | 返回值 | 说明 |
+|--------|------|--------|------|
+| `mt_taskpool_attach` | `int slot, int capacity, int flags` | `int` | 在当前组（分组模式）或全局（非分组模式）创建并挂载任务池 |
+| `mt_taskpool_detach` | `int slot` | `int` | 解挂并释放任务池（要求已 shutdown 且无在途任务） |
+| `mt_taskpool_begin` | `int slot` | `int` | 开启新一轮（epoch），重置队列并唤醒 worker |
+| `mt_taskpool_submit` | `int slot, mt_task_fn fn, void* ctx` | `int` | 提交任务到队列 |
+| `mt_taskpool_close` | `int slot` | `int` | 关闭本轮提交，worker 仅 drain 队列后结束本轮 |
+| `mt_taskpool_wait` | `int slot` | `int` | 等待所有 worker 完成本轮 |
+| `mt_taskpool_shutdown` | `int slot` | `int` | 通知 worker loop 退出（建议在 EndThreads 前调用） |
+| `mt_taskpool_worker_loop` | `int slot` | `int` | worker 执行循环：等待 epoch，取任务执行，直至 shutdown |
+
+flags：
+
+- `MT_TASKPOOL_BLOCK`：队列满时阻塞等待空间（默认行为）
+- `MT_TASKPOOL_SPIN`：队列满时自旋退避等待空间
+- `MT_TASKPOOL_TRY`：队列满时立即返回失败
+
+典型调用顺序（分组模式，组内）：
+
+- 组主线程（tid=0）：`attach -> (begin -> submit* -> close -> wait)* -> shutdown -> detach`
+- 从线程（tid>0）：`worker_loop`
+
+挂载位置：
+
+- `ThreadG=1` 且在组内线程调用时，任务池挂在 `gi->locv[slot]`
+- `ThreadG=0` 或在非组上下文调用时，任务池挂在 `md.locv[slot]`
+
 ## 7. 全局变量
 
 | 变量名 | 类型 | 说明 |

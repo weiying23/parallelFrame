@@ -1,12 +1,17 @@
 #define _GNU_SOURCE
-#include <sched.h>
 #include <pthread.h>
 #include <stdio.h>
 #include "mythread.h" //
-#include <malloc.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+#ifdef __APPLE__
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#else
+#include <sched.h>
+#endif
 #ifdef DEBUG
 //#define DBGSYNC
 #endif
@@ -37,6 +42,15 @@ int GetVInt(int volatile *volatile p){
 }
 
 int getcpuid(){
+#ifdef __APPLE__
+  int cpu = 0;
+  size_t size = sizeof(cpu);
+  if (sysctlbyname("hw.logicalcpu", &cpu, &size, NULL, 0) == -1) {
+    printf("warning: could not get CPU affinity , continuing...\n");
+    return -1;
+  }
+  return cpu;
+#else
   cpu_set_t mask;  //CPU核的集合
   CPU_ZERO(&mask);    //置空
   if (sched_getaffinity(0, sizeof(mask), &mask) == -1){//设置线程CPU亲和力
@@ -49,20 +63,21 @@ int getcpuid(){
     }
   }
   return 0;
+#endif
 }
 
 void initthreads_(int *mpi_id_,int *NCorePClu_ ,int *NCluPNode_,int *NCorePGrp_,int *NThPGrp_,int *NGrpPProc_,int *NProcPNode_,int *ManageCoreId_,int *err){
   *err=InitThreads(*mpi_id_,*NCorePClu_,* NCluPNode_,* NCorePGrp_,*NThPGrp_,*NGrpPProc_,*NProcPNode_,ManageCoreId_);
 }
-void startthreads_(){
+void startthreads_(){  
   StartThreads(thread_run);
 }
-void endthreads_(){
+void endthreads_(){  
   EndThreads();
 }
 void initdatasize(int tsize,int gsize){
 }
-void setthread(int NCorePClu_,int NThPGrp_,int NGrpPProc_,int NProcPNode_,int ManageCoreId_){
+void setthread(int NCorePClu_,int NThPGrp_,int NGrpPProc_,int NProcPNode_,int ManageCoreId_){  
   if(NCorePClu_>0){
     NCorePClu=NCorePClu_;
     NCorePGrp=NCorePClu_;
@@ -157,17 +172,17 @@ void *GetLocV(int typ,int ind,void*p){
   if(ind<0||ind>100){
     return NULL;
   }
+  if(ind<8) return pl[ind];
   if(*pnlocv<=ind){
     return NULL;
   }
-  if(ind<8) return pl[ind];
   void **pp=(void**)pl[7];
   if(!pp){
     return NULL;
   }
   return pp[ind-7];
 }
-int InitThreads(int mpi_id_,int NCorePClu_ ,int NCluPNode_,int NCorePGrp_,int NThPGrp_,int NGrpPProc_,int NProcPNode_,int *ManageCoreId_){
+int InitThreads(int mpi_id_,int NCorePClu_ ,int NCluPNode_,int NCorePGrp_,int NThPGrp_,int NGrpPProc_,int NProcPNode_,int *ManageCoreId_){  
   mpi_id      =mpi_id_;
   md.mpi_id   =mpi_id_;
 #define VD(d,v) if(v>0)d=v;
@@ -220,18 +235,22 @@ void threadMain(HTHREADINFO pti){
   bindthread();
   _threadmain_(pti);
 }
-void StartThreads(TFunc tfun){
+void StartThreads(TFunc tfun){  
   
   zStartThreads(tfun,0,0,1);
   //printf("startthreads over\n");
 }
-void EndThreads(){
+void EndThreads(){  
  // printf("End multithread comput\n");
 
   zStartThreads(NULL,0,0,1);
   //printf("endthreads over\n");
 }
 int bindcpu(int id){
+#ifdef __APPLE__
+  // macOS does not support sched_setaffinity, so we just return 0
+  return 0;
+#else
   cpu_set_t mask;  //CPU核的集合
   CPU_ZERO(&mask);    //置空
   CPU_SET(id,&mask);   //设置亲和力值
@@ -240,6 +259,7 @@ int bindcpu(int id){
     return -1;
   }
   return 0;
+#endif
 }
 void bindthread(){
   if(ti) bindcpu(ti->indg);
@@ -853,4 +873,246 @@ void zStartThreads(TFunc tfun,void*para,int detach,int clear){
 
 void padr_(int *id,double*p){
   printf("ZZZZZZZZZZZZZZz : %d %p\n",*id,p);
+}
+
+typedef struct _mt_taskpool{
+  int capacity;
+  int flags;
+  int slot;
+  pthread_mutex_t mu;
+  pthread_cond_t cv_epoch;
+  pthread_cond_t cv_nonempty;
+  pthread_cond_t cv_nonfull;
+  int shutdown;
+  int open;
+  unsigned int epoch;
+  int head;
+  int tail;
+  int count;
+  int nworkers;
+  int done_count;
+  int workers_exited;
+  mt_task *buf;
+} mt_taskpool;
+
+static void mt_mu_unlock(void *p){
+  pthread_mutex_unlock((pthread_mutex_t*)p);
+}
+
+static inline int mt_taskpool_typ(){
+  if(ThreadG && gi && ti && ti->igrp>=0) return 1;
+  return 2;
+}
+
+static inline int mt_taskpool_nworkers(){
+  if(!ti) return 0;
+  int n=ti->Nthreads-1;
+  if(n<0) n=0;
+  return n;
+}
+
+static inline int mt_taskpool_valid_slot(int slot){
+  return slot>=0 && slot<=100;
+}
+
+static mt_taskpool *mt_taskpool_get(int slot){
+  int typ=mt_taskpool_typ();
+  if(!mt_taskpool_valid_slot(slot)) return NULL;
+  return (mt_taskpool*)GetLocV(typ,slot,NULL);
+}
+
+int mt_taskpool_attach(int slot,int capacity,int flags){
+  int typ=mt_taskpool_typ();
+  if(!mt_taskpool_valid_slot(slot)) return -5;
+  if(capacity<=0) return -1;
+  if(GetLocV(typ,slot,NULL)) return -2;
+  mt_taskpool *tp=(mt_taskpool*)hmalloc(sizeof(*tp));
+  if(!tp) return -3;
+  memset(tp,0,sizeof(*tp));
+  tp->capacity=capacity;
+  tp->flags=flags;
+  tp->slot=slot;
+  tp->buf=(mt_task*)hmalloc((size_t)capacity*sizeof(*tp->buf));
+  if(!tp->buf){
+    free(tp);
+    return -4;
+  }
+  pthread_mutex_init(&tp->mu,NULL);
+  pthread_cond_init(&tp->cv_epoch,NULL);
+  pthread_cond_init(&tp->cv_nonempty,NULL);
+  pthread_cond_init(&tp->cv_nonfull,NULL);
+  tp->shutdown=0;
+  tp->open=0;
+  tp->epoch=0;
+  tp->head=tp->tail=tp->count=0;
+  tp->nworkers=mt_taskpool_nworkers();
+  tp->done_count=0;
+  SetLocV(typ,slot,tp);
+  return 0;
+}
+
+int mt_taskpool_detach(int slot){
+  int typ=mt_taskpool_typ();
+  mt_taskpool *tp=(mt_taskpool*)GetLocV(typ,slot,NULL);
+  if(!tp) return -1;
+  pthread_mutex_lock(&tp->mu);
+  if(!tp->shutdown || tp->open || tp->count>0 || tp->done_count<tp->nworkers){
+    pthread_mutex_unlock(&tp->mu);
+    return -2;
+  }
+  while(tp->workers_exited<tp->nworkers){
+    pthread_cleanup_push(mt_mu_unlock,&tp->mu);
+    pthread_cond_wait(&tp->cv_epoch,&tp->mu);
+    pthread_cleanup_pop(0);
+  }
+  pthread_mutex_unlock(&tp->mu);
+  SetLocV(typ,slot,NULL);
+  pthread_cond_destroy(&tp->cv_nonfull);
+  pthread_cond_destroy(&tp->cv_nonempty);
+  pthread_cond_destroy(&tp->cv_epoch);
+  pthread_mutex_destroy(&tp->mu);
+  free(tp->buf);
+  free(tp);
+  return 0;
+}
+
+int mt_taskpool_begin(int slot){
+  mt_taskpool *tp=mt_taskpool_get(slot);
+  if(!tp) return -1;
+  pthread_mutex_lock(&tp->mu);
+  if(tp->shutdown){
+    pthread_mutex_unlock(&tp->mu);
+    return -2;
+  }
+  if(tp->open || tp->count!=0){
+    pthread_mutex_unlock(&tp->mu);
+    return -3;
+  }
+  tp->nworkers=mt_taskpool_nworkers();
+  tp->done_count=0;
+  tp->workers_exited=0;
+  tp->head=tp->tail=tp->count=0;
+  tp->open=1;
+  tp->epoch++;
+  pthread_cond_broadcast(&tp->cv_epoch);
+  pthread_mutex_unlock(&tp->mu);
+  return 0;
+}
+
+int mt_taskpool_submit(int slot,mt_task_fn fn,void *ctx){
+  mt_taskpool *tp=mt_taskpool_get(slot);
+  if(!tp) return -1;
+  if(!fn) return -2;
+  pthread_mutex_lock(&tp->mu);
+  while(1){
+    if(tp->shutdown || !tp->open){
+      pthread_mutex_unlock(&tp->mu);
+      return -3;
+    }
+    if(tp->count<tp->capacity) break;
+    if(tp->flags & MT_TASKPOOL_TRY){
+      pthread_mutex_unlock(&tp->mu);
+      return -4;
+    }
+    if(tp->flags & MT_TASKPOOL_SPIN){
+      pthread_mutex_unlock(&tp->mu);
+      ntdelay(1);
+      pthread_mutex_lock(&tp->mu);
+      continue;
+    }
+    pthread_cleanup_push(mt_mu_unlock,&tp->mu);
+    pthread_cond_wait(&tp->cv_nonfull,&tp->mu);
+    pthread_cleanup_pop(0);
+  }
+  tp->buf[tp->tail].fn=fn;
+  tp->buf[tp->tail].ctx=ctx;
+  tp->tail++;
+  if(tp->tail>=tp->capacity) tp->tail=0;
+  tp->count++;
+  pthread_cond_signal(&tp->cv_nonempty);
+  pthread_mutex_unlock(&tp->mu);
+  return 0;
+}
+
+int mt_taskpool_close(int slot){
+  mt_taskpool *tp=mt_taskpool_get(slot);
+  if(!tp) return -1;
+  pthread_mutex_lock(&tp->mu);
+  tp->open=0;
+  pthread_cond_broadcast(&tp->cv_nonempty);
+  pthread_cond_broadcast(&tp->cv_epoch);
+  pthread_mutex_unlock(&tp->mu);
+  return 0;
+}
+
+int mt_taskpool_wait(int slot){
+  mt_taskpool *tp=mt_taskpool_get(slot);
+  if(!tp) return -1;
+  pthread_mutex_lock(&tp->mu);
+  while(tp->done_count<tp->nworkers && !tp->shutdown){
+    pthread_cleanup_push(mt_mu_unlock,&tp->mu);
+    pthread_cond_wait(&tp->cv_epoch,&tp->mu);
+    pthread_cleanup_pop(0);
+  }
+  pthread_mutex_unlock(&tp->mu);
+  return 0;
+}
+
+int mt_taskpool_shutdown(int slot){
+  mt_taskpool *tp=mt_taskpool_get(slot);
+  if(!tp) return -1;
+  pthread_mutex_lock(&tp->mu);
+  tp->shutdown=1;
+  tp->open=0;
+  pthread_cond_broadcast(&tp->cv_nonfull);
+  pthread_cond_broadcast(&tp->cv_nonempty);
+  pthread_cond_broadcast(&tp->cv_epoch);
+  pthread_mutex_unlock(&tp->mu);
+  return 0;
+}
+
+int mt_taskpool_worker_loop(int slot){
+  mt_taskpool *tp=mt_taskpool_get(slot);
+  if(!tp) return -1;
+  unsigned int local_epoch=0;
+  for(;;){
+    pthread_mutex_lock(&tp->mu);
+    while(!tp->shutdown && tp->epoch==local_epoch){
+      pthread_cleanup_push(mt_mu_unlock,&tp->mu);
+      pthread_cond_wait(&tp->cv_epoch,&tp->mu);
+      pthread_cleanup_pop(0);
+    }
+    if(tp->shutdown){
+      tp->workers_exited++;
+      pthread_cond_broadcast(&tp->cv_epoch);
+      pthread_mutex_unlock(&tp->mu);
+      break;
+    }
+    local_epoch=tp->epoch;
+    for(;;){
+      while(!tp->shutdown && tp->count==0 && tp->open){
+        pthread_cleanup_push(mt_mu_unlock,&tp->mu);
+        pthread_cond_wait(&tp->cv_nonempty,&tp->mu);
+        pthread_cleanup_pop(0);
+      }
+      if(tp->shutdown) break;
+      if(tp->count==0 && !tp->open) break;
+      mt_task t=tp->buf[tp->head];
+      tp->head++;
+      if(tp->head>=tp->capacity) tp->head=0;
+      tp->count--;
+      pthread_cond_signal(&tp->cv_nonfull);
+      pthread_mutex_unlock(&tp->mu);
+      t.fn(t.ctx);
+      pthread_mutex_lock(&tp->mu);
+    }
+    tp->done_count++;
+    if(tp->done_count>=tp->nworkers){
+      pthread_cond_broadcast(&tp->cv_epoch);
+    } else {
+      pthread_cond_signal(&tp->cv_epoch);
+    }
+    pthread_mutex_unlock(&tp->mu);
+  }
+  return 0;
 }
