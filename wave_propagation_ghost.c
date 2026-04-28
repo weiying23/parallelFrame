@@ -84,6 +84,10 @@
 #define CFL_Y (C0 * DT / DY)
 #define CFL_SUM2 (CFL_X * CFL_X + CFL_Y * CFL_Y)
 
+#define SLOT_TP 0
+#define TP_CAP 512
+#define CHUNK_ROWS 16
+
 typedef struct {
   double *u_prev;
   double *u_curr;
@@ -132,6 +136,21 @@ typedef struct {
   double t_allreduce;
   int energy_steps;
 } ThreadTask;
+
+typedef struct {
+  int y_begin, y_end;
+  int x_begin, x_end;
+} RowTaskCtx;
+
+typedef struct {
+  RowTaskCtx *tasks;
+  int n_tasks;
+} GroupTaskPlan;
+
+static GroupTaskPlan *g_group_plans = NULL;
+static RowTaskCtx *g_flat_tasks = NULL;
+static int g_n_flat_tasks = 0;
+static double g_energy_acc = 0.0;
 
 static SimulationData g_sim = {0};
 static double *g_send_up = NULL;
@@ -250,22 +269,6 @@ static void wait_phase_from_main(int state) {
     mWaitGrps(state);
   } else {
     mWaitSubs(state);
-  }
-}
-
-static void wait_phase_from_worker(int state) {
-  if (uses_group_threads()) {
-    sWaitGrp(state);
-  } else {
-    sWaitState(state);
-  }
-}
-
-static void finish_phase_from_worker(int state) {
-  if (uses_group_threads()) {
-    sSetGrp(state);
-  } else {
-    sSetState(state);
   }
 }
 
@@ -472,10 +475,6 @@ static void choose_group_grid(int groups,int *gx,int *gy) {
   choose_2d_grid(groups, g_sim.local_nx, g_sim.local_ny, gx, gy);
 }
 
-static void choose_worker_grid(int workers,int span_x,int span_y,int *tx,int *ty) {
-  choose_2d_grid(workers, span_x, span_y, tx, ty);
-}
-
 static void setup_process_domain(int mpi_rank,int mpi_size) {
   int px, py;
 
@@ -505,25 +504,6 @@ static double initial_condition_value(int global_y,int global_x) {
   double dy = global_y * DY - cy;
 
   return A * exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma));
-}
-
-static void initialize_field_block(const ThreadTask *task) {
-  for (int y = task->y_begin; y < task->y_end; y++) {
-    int global_y = global_y_from_local(y);
-
-    for (int x = task->x_begin; x < task->x_end; x++) {
-      int global_x = global_x_from_local(x);
-      size_t p = idx(y, x);
-      double value = 0.0;
-
-      if (global_x != 0 && global_x != NX - 1 && global_y != 0 && global_y != NY - 1) {
-        value = initial_condition_value(global_y, global_x);
-      }
-      g_sim.u_curr[p] = value;
-      g_sim.u_prev[p] = value;
-      g_sim.u_next[p] = 0.0;
-    }
-  }
 }
 
 static void init_simulation(int mpi_rank,int mpi_size) {
@@ -577,6 +557,19 @@ static void free_simulation(void) {
 static void free_group_energy(void) {
   free(g_group_energy);
   g_group_energy = NULL;
+}
+
+static void free_task_plans(void) {
+  if (g_group_plans) {
+    for (int g = 0; g < md.ngrp; g++) {
+      free(g_group_plans[g].tasks);
+    }
+    free(g_group_plans);
+    g_group_plans = NULL;
+  }
+  free(g_flat_tasks);
+  g_flat_tasks = NULL;
+  g_n_flat_tasks = 0;
 }
 
 static void enforce_dirichlet_boundaries(double *field) {
@@ -721,138 +714,130 @@ static void exchange_halos_for(double *field, ThreadTask *task) {
   end_halo_exchange_for(field, requests, request_count, task);
 }
 
-static void compute_block_region(const ThreadTask *task,int y_begin,int y_end,int x_begin,int x_end) {
-  (void)task;
+static void task_init_field(void *ctx) {
+  RowTaskCtx *c = (RowTaskCtx*)ctx;
+  for (int y = c->y_begin; y < c->y_end; y++) {
+    int global_y = global_y_from_local(y);
+    for (int x = c->x_begin; x < c->x_end; x++) {
+      int global_x = global_x_from_local(x);
+      size_t p = idx(y, x);
+      double value = 0.0;
+      if (global_x != 0 && global_x != NX - 1 && global_y != 0 && global_y != NY - 1) {
+        value = initial_condition_value(global_y, global_x);
+      }
+      g_sim.u_curr[p] = value;
+      g_sim.u_prev[p] = value;
+      g_sim.u_next[p] = 0.0;
+    }
+  }
+}
+
+static void task_compute_interior(void *ctx) {
+  RowTaskCtx *c = (RowTaskCtx*)ctx;
+  int y_begin = c->y_begin, y_end = c->y_end;
+  int x_begin = c->x_begin, x_end = c->x_end;
+
+  if (g_sim.neighbor_down >= 0 && y_begin < HALO + 1) y_begin = HALO + 1;
+  if (g_sim.neighbor_up >= 0 && y_end > g_sim.local_ny) y_end = g_sim.local_ny;
+  if (g_sim.neighbor_left >= 0 && x_begin < HALO + 1) x_begin = HALO + 1;
+  if (g_sim.neighbor_right >= 0 && x_end > g_sim.local_nx) x_end = g_sim.local_nx;
+
+  if (y_begin >= y_end || x_begin >= x_end) return;
 
   for (int y = y_begin; y < y_end; y++) {
     int global_y = global_y_from_local(y);
-
-    if (global_y == 0 || global_y == NY - 1) {
-      continue;
-    }
-
+    if (global_y == 0 || global_y == NY - 1) continue;
     for (int x = x_begin; x < x_end; x++) {
       int global_x = global_x_from_local(x);
-
-      if (global_x == 0 || global_x == NX - 1) {
-        continue;
-      }
-
+      if (global_x == 0 || global_x == NX - 1) continue;
       double u_ij = g_sim.u_curr[idx(y, x)];
       double d2x = (g_sim.u_curr[idx(y, x - 1)] - 2.0 * u_ij + g_sim.u_curr[idx(y, x + 1)]) / (DX * DX);
       double d2y = (g_sim.u_curr[idx(y - 1, x)] - 2.0 * u_ij + g_sim.u_curr[idx(y + 1, x)]) / (DY * DY);
-      double next = 2.0 * u_ij - g_sim.u_prev[idx(y, x)] + C0 * C0 * DT2 * (d2x + d2y);
-
-      g_sim.u_next[idx(y, x)] = next;
+      g_sim.u_next[idx(y, x)] = 2.0 * u_ij - g_sim.u_prev[idx(y, x)] + C0 * C0 * DT2 * (d2x + d2y);
     }
   }
 }
 
-static void compute_interior_block(const ThreadTask *task) {
-  int y_begin = task->y_begin;
-  int y_end = task->y_end;
-  int x_begin = task->x_begin;
-  int x_end = task->x_end;
+static void task_compute_boundary(void *ctx) {
+  RowTaskCtx *c = (RowTaskCtx*)ctx;
+  int lower_row = HALO, upper_row = g_sim.local_ny;
+  int left_col = HALO, right_col = g_sim.local_nx;
+  int x_begin = c->x_begin, x_end = c->x_end;
+  int y_begin = c->y_begin, y_end = c->y_end;
 
-  if (g_sim.neighbor_down >= 0 && y_begin < HALO + 1) {
-    y_begin = HALO + 1;
-  }
-  if (g_sim.neighbor_up >= 0 && y_end > g_sim.local_ny) {
-    y_end = g_sim.local_ny;
-  }
-
-  if (g_sim.neighbor_left >= 0 && x_begin < HALO + 1) {
-    x_begin = HALO + 1;
-  }
-  if (g_sim.neighbor_right >= 0 && x_end > g_sim.local_nx) {
-    x_end = g_sim.local_nx;
-  }
-
-  if (y_begin < y_end && x_begin < x_end) {
-    compute_block_region(task, y_begin, y_end, x_begin, x_end);
-  }
-}
-
-static void compute_boundary_block(const ThreadTask *task) {
-  int lower_row = HALO;
-  int upper_row = g_sim.local_ny;
-  int left_col = HALO;
-  int right_col = g_sim.local_nx;
-  int x_begin = task->x_begin;
-  int x_end = task->x_end;
-  int y_begin = task->y_begin;
-  int y_end = task->y_end;
-
-  if (x_begin < HALO) {
-    x_begin = HALO;
-  }
-  if (x_end > HALO + g_sim.local_nx) {
-    x_end = HALO + g_sim.local_nx;
-  }
-  if (y_begin < HALO) {
-    y_begin = HALO;
-  }
-  if (y_end > HALO + g_sim.local_ny) {
-    y_end = HALO + g_sim.local_ny;
-  }
+  if (x_begin < HALO) x_begin = HALO;
+  if (x_end > HALO + g_sim.local_nx) x_end = HALO + g_sim.local_nx;
+  if (y_begin < HALO) y_begin = HALO;
+  if (y_end > HALO + g_sim.local_ny) y_end = HALO + g_sim.local_ny;
 
   if (g_sim.neighbor_down >= 0 && y_begin <= lower_row && lower_row < y_end) {
-    compute_block_region(task, lower_row, lower_row + 1, x_begin, x_end);
+    for (int x = x_begin; x < x_end; x++) {
+      int global_x = global_x_from_local(x);
+      if (global_x == 0 || global_x == NX - 1) continue;
+      double u_ij = g_sim.u_curr[idx(lower_row, x)];
+      double d2x = (g_sim.u_curr[idx(lower_row, x - 1)] - 2.0 * u_ij + g_sim.u_curr[idx(lower_row, x + 1)]) / (DX * DX);
+      double d2y = (g_sim.u_curr[idx(lower_row - 1, x)] - 2.0 * u_ij + g_sim.u_curr[idx(lower_row + 1, x)]) / (DY * DY);
+      g_sim.u_next[idx(lower_row, x)] = 2.0 * u_ij - g_sim.u_prev[idx(lower_row, x)] + C0 * C0 * DT2 * (d2x + d2y);
+    }
   }
-  if (g_sim.neighbor_up >= 0 &&
-      upper_row != lower_row &&
-      y_begin <= upper_row &&
-      upper_row < y_end) {
-    compute_block_region(task, upper_row, upper_row + 1, x_begin, x_end);
+  if (g_sim.neighbor_up >= 0 && upper_row != lower_row && y_begin <= upper_row && upper_row < y_end) {
+    for (int x = x_begin; x < x_end; x++) {
+      int global_x = global_x_from_local(x);
+      if (global_x == 0 || global_x == NX - 1) continue;
+      double u_ij = g_sim.u_curr[idx(upper_row, x)];
+      double d2x = (g_sim.u_curr[idx(upper_row, x - 1)] - 2.0 * u_ij + g_sim.u_curr[idx(upper_row, x + 1)]) / (DX * DX);
+      double d2y = (g_sim.u_curr[idx(upper_row - 1, x)] - 2.0 * u_ij + g_sim.u_curr[idx(upper_row + 1, x)]) / (DY * DY);
+      g_sim.u_next[idx(upper_row, x)] = 2.0 * u_ij - g_sim.u_prev[idx(upper_row, x)] + C0 * C0 * DT2 * (d2x + d2y);
+    }
   }
-
   if (g_sim.neighbor_left >= 0 && x_begin <= left_col && left_col < x_end) {
-    compute_block_region(task, y_begin, y_end, left_col, left_col + 1);
+    for (int y = y_begin; y < y_end; y++) {
+      int global_y = global_y_from_local(y);
+      if (global_y == 0 || global_y == NY - 1) continue;
+      double u_ij = g_sim.u_curr[idx(y, left_col)];
+      double d2x = (g_sim.u_curr[idx(y, left_col - 1)] - 2.0 * u_ij + g_sim.u_curr[idx(y, left_col + 1)]) / (DX * DX);
+      double d2y = (g_sim.u_curr[idx(y - 1, left_col)] - 2.0 * u_ij + g_sim.u_curr[idx(y + 1, left_col)]) / (DY * DY);
+      g_sim.u_next[idx(y, left_col)] = 2.0 * u_ij - g_sim.u_prev[idx(y, left_col)] + C0 * C0 * DT2 * (d2x + d2y);
+    }
   }
-  if (g_sim.neighbor_right >= 0 &&
-      right_col != left_col &&
-      x_begin <= right_col &&
-      right_col < x_end) {
-    compute_block_region(task, y_begin, y_end, right_col, right_col + 1);
+  if (g_sim.neighbor_right >= 0 && right_col != left_col && x_begin <= right_col && right_col < x_end) {
+    for (int y = y_begin; y < y_end; y++) {
+      int global_y = global_y_from_local(y);
+      if (global_y == 0 || global_y == NY - 1) continue;
+      double u_ij = g_sim.u_curr[idx(y, right_col)];
+      double d2x = (g_sim.u_curr[idx(y, right_col - 1)] - 2.0 * u_ij + g_sim.u_curr[idx(y, right_col + 1)]) / (DX * DX);
+      double d2y = (g_sim.u_curr[idx(y - 1, right_col)] - 2.0 * u_ij + g_sim.u_curr[idx(y + 1, right_col)]) / (DY * DY);
+      g_sim.u_next[idx(y, right_col)] = 2.0 * u_ij - g_sim.u_prev[idx(y, right_col)] + C0 * C0 * DT2 * (d2x + d2y);
+    }
   }
 }
 
-static double compute_energy_block(const ThreadTask *task) {
-  double kinetic = 0.0;
-  double potential_x = 0.0;
-  double potential_y = 0.0;
+static void task_compute_energy(void *ctx) {
+  RowTaskCtx *c = (RowTaskCtx*)ctx;
+  double kinetic = 0.0, potential_x = 0.0, potential_y = 0.0;
   double cell_area = DX * DY;
-  int x_edge_begin;
-  int x_edge_end;
 
-  if (task->x_begin >= task->x_end || task->y_begin >= task->y_end) {
-    return 0.0;
-  }
+  if (c->x_begin >= c->x_end || c->y_begin >= c->y_end) return;
 
-  x_edge_begin = (task->x_begin == HALO) ? (HALO - 1) : task->x_begin;
-  x_edge_end = task->x_end;
-  if (x_edge_end > HALO + g_sim.local_nx) {
-    x_edge_end = HALO + g_sim.local_nx;
-  }
+  int x_edge_begin = (c->x_begin == HALO) ? (HALO - 1) : c->x_begin;
+  int x_edge_end = c->x_end;
+  if (x_edge_end > HALO + g_sim.local_nx) x_edge_end = HALO + g_sim.local_nx;
 
-  for (int y = task->y_begin; y < task->y_end; y++) {
+  for (int y = c->y_begin; y < c->y_end; y++) {
     int global_y = global_y_from_local(y);
-
     if (global_y > 0 && global_y < NY - 1) {
-      for (int x = task->x_begin; x < task->x_end; x++) {
+      for (int x = c->x_begin; x < c->x_end; x++) {
         double ut = (g_sim.u_curr[idx(y, x)] - g_sim.u_prev[idx(y, x)]) / DT;
         kinetic += ut * ut;
       }
     }
-
     for (int x = x_edge_begin; x < x_edge_end; x++) {
       double du_curr = (g_sim.u_curr[idx(y, x + 1)] - g_sim.u_curr[idx(y, x)]) / DX;
       double du_prev = (g_sim.u_prev[idx(y, x + 1)] - g_sim.u_prev[idx(y, x)]) / DX;
       potential_x += du_curr * du_prev;
     }
-
     if (global_y < NY - 1) {
-      for (int x = task->x_begin; x < task->x_end; x++) {
+      for (int x = c->x_begin; x < c->x_end; x++) {
         double du_curr = (g_sim.u_curr[idx(y + 1, x)] - g_sim.u_curr[idx(y, x)]) / DY;
         double du_prev = (g_sim.u_prev[idx(y + 1, x)] - g_sim.u_prev[idx(y, x)]) / DY;
         potential_y += du_curr * du_prev;
@@ -860,7 +845,12 @@ static double compute_energy_block(const ThreadTask *task) {
     }
   }
 
-  return 0.5 * (kinetic + C0 * C0 * (potential_x + potential_y)) * cell_area;
+  double partial = 0.5 * (kinetic + C0 * C0 * (potential_x + potential_y)) * cell_area;
+  union { double d; uint64_t i; } old, new;
+  do {
+    old.d = g_energy_acc;
+    new.d = old.d + partial;
+  } while (!__sync_bool_compare_and_swap((volatile uint64_t*)&g_energy_acc, old.i, new.i));
 }
 
 static double accumulate_worker_energy(void) {
@@ -880,18 +870,6 @@ static double accumulate_worker_energy(void) {
   return local_energy;
 }
 
-static double reduce_group_worker_energy(int group_id) {
-  double energy = 0.0;
-  threadGroup *pg = md.grps[group_id];
-
-  for (int t = 1; t < pg->Nthreads; t++) {
-    ThreadTask *task = (ThreadTask*)pg->threads[t].td;
-    energy += task->partial_energy;
-  }
-
-  return energy;
-}
-
 static void swap_fields(void) {
   double *tmp = g_sim.u_prev;
   g_sim.u_prev = g_sim.u_curr;
@@ -900,128 +878,76 @@ static void swap_fields(void) {
 }
 
 static void setup_group_thread_tasks(void) {
-  int gpx = 1;
-  int gpy = 1;
+  int gpx = 1, gpy = 1;
 
   choose_group_grid(md.ngrp, &gpx, &gpy);
+  g_group_plans = (GroupTaskPlan*)calloc((size_t)md.ngrp, sizeof(*g_group_plans));
+  if (!g_group_plans) { fprintf(stderr,"alloc group plans failed\n"); MPI_Abort(MPI_COMM_WORLD,1); }
 
   for (int g = 0; g < md.ngrp; g++) {
     threadGroup *pg = md.grps[g];
-    int worker_count = pg->Nthreads - 1;
-    int gx = g % gpx;
-    int gy = g / gpx;
-    int x_group_begin, x_group_end;
-    int y_group_begin, y_group_end;
-    int tx = 1;
-    int ty = 1;
+    int gx = g % gpx, gy = g / gpx;
+    int x_group_begin, x_group_end, y_group_begin, y_group_end;
 
     split_range(HALO, HALO + g_sim.local_nx, gpx, gx, &x_group_begin, &x_group_end);
     split_range(HALO, HALO + g_sim.local_ny, gpy, gy, &y_group_begin, &y_group_end);
 
-    if (worker_count > 0) {
-      choose_worker_grid(
-        worker_count,
-        x_group_end - x_group_begin,
-        y_group_end - y_group_begin,
-        &tx,
-        &ty
-      );
+    int n_rows = y_group_end - y_group_begin;
+    int n_chunks = (n_rows + CHUNK_ROWS - 1) / CHUNK_ROWS;
+    GroupTaskPlan *plan = &g_group_plans[g];
+    plan->n_tasks = n_chunks;
+    plan->tasks = (RowTaskCtx*)calloc((size_t)n_chunks, sizeof(*plan->tasks));
+    if (!plan->tasks) { fprintf(stderr,"alloc group tasks failed\n"); MPI_Abort(MPI_COMM_WORLD,1); }
+
+    for (int i = 0; i < n_chunks; i++) {
+      int cy_begin = y_group_begin + i * CHUNK_ROWS;
+      int cy_end = cy_begin + CHUNK_ROWS;
+      if (cy_end > y_group_end) cy_end = y_group_end;
+      plan->tasks[i].y_begin = cy_begin;
+      plan->tasks[i].y_end = cy_end;
+      plan->tasks[i].x_begin = x_group_begin;
+      plan->tasks[i].x_end = x_group_end;
     }
 
     for (int t = 0; t < pg->Nthreads; t++) {
-      THREADINFO *pti = &pg->threads[t];
-      ThreadTask *task = (ThreadTask*)pti->td;
-      int x_begin, x_end;
-      int y_begin, y_end;
-
-      if (t == 0 || worker_count <= 0) {
-        x_begin = x_group_begin;
-        x_end = x_group_begin;
-        y_begin = y_group_begin;
-        y_end = y_group_begin;
-      } else {
-        int worker_id = t - 1;
-        int tx_id = worker_id % tx;
-        int ty_id = worker_id / tx;
-
-        split_range(x_group_begin, x_group_end, tx, tx_id, &x_begin, &x_end);
-        split_range(y_group_begin, y_group_end, ty, ty_id, &y_begin, &y_end);
-      }
-
+      ThreadTask *task = (ThreadTask*)pg->threads[t].td;
       task->gid = g;
       task->tid = t;
-      task->x_begin = x_begin;
-      task->x_end = x_end;
-      task->y_begin = y_begin;
-      task->y_end = y_end;
+      task->x_begin = x_group_begin;
+      task->x_end = x_group_end;
+      task->y_begin = y_group_begin;
+      task->y_end = y_group_end;
       reset_task_timers(task);
-
-#ifdef DEBUG
-      printf(
-        "[Init] MPI=%d Group=%d/%d Thread=%d role=%s global-x=[%d,%d) global-y=[%d,%d) x=[%d,%d) y=[%d,%d)\n",
-        mpi_id,
-        g,
-        md.ngrp,
-        t,
-        (t == 0) ? "group-main" : "worker",
-        global_x_from_local(x_begin),
-        global_x_from_local(x_end),
-        global_y_from_local(y_begin),
-        global_y_from_local(y_end),
-        x_begin,
-        x_end,
-        y_begin,
-        y_end
-      );
-#endif // DEBUG
     }
   }
 }
 
 static void setup_single_group_tasks(void) {
-  int worker_count = md.Nthreads - 1;
-  int tx = 1;
-  int ty = 1;
+  int n_rows = g_sim.local_ny;
+  g_n_flat_tasks = (n_rows + CHUNK_ROWS - 1) / CHUNK_ROWS;
+  g_flat_tasks = (RowTaskCtx*)calloc((size_t)g_n_flat_tasks, sizeof(*g_flat_tasks));
+  if (!g_flat_tasks) { fprintf(stderr,"alloc flat tasks failed\n"); MPI_Abort(MPI_COMM_WORLD,1); }
 
-  if (worker_count > 0) {
-    choose_worker_grid(worker_count, g_sim.local_nx, g_sim.local_ny, &tx, &ty);
+  for (int i = 0; i < g_n_flat_tasks; i++) {
+    int cy_begin = HALO + i * CHUNK_ROWS;
+    int cy_end = cy_begin + CHUNK_ROWS;
+    if (cy_end > HALO + g_sim.local_ny) cy_end = HALO + g_sim.local_ny;
+    g_flat_tasks[i].y_begin = cy_begin;
+    g_flat_tasks[i].y_end = cy_end;
+    g_flat_tasks[i].x_begin = HALO;
+    g_flat_tasks[i].x_end = HALO + g_sim.local_nx;
   }
 
+  int worker_count = md.Nthreads - 1;
   for (int t = 0; t < worker_count; t++) {
-    THREADINFO *pti = &md.threads[t];
-    ThreadTask *task = (ThreadTask*)pti->td;
-    int x_begin, x_end;
-    int y_begin, y_end;
-    int tx_id = t % tx;
-    int ty_id = t / tx;
-
-    split_range(HALO, HALO + g_sim.local_nx, tx, tx_id, &x_begin, &x_end);
-    split_range(HALO, HALO + g_sim.local_ny, ty, ty_id, &y_begin, &y_end);
-
+    ThreadTask *task = (ThreadTask*)md.threads[t].td;
     task->gid = 0;
     task->tid = t;
-    task->x_begin = x_begin;
-    task->x_end = x_end;
-    task->y_begin = y_begin;
-    task->y_end = y_end;
+    task->x_begin = HALO;
+    task->x_end = HALO + g_sim.local_nx;
+    task->y_begin = HALO;
+    task->y_end = HALO + g_sim.local_ny;
     reset_task_timers(task);
-
-#ifdef DEBUG
-    printf(
-      "[Init] MPI=%d Group=%d Thread=%d role=worker global-x=[%d,%d) global-y=[%d,%d) x=[%d,%d) y=[%d,%d)\n",
-      mpi_id,
-      0,
-      t,
-      global_x_from_local(x_begin),
-      global_x_from_local(x_end),
-      global_y_from_local(y_begin),
-      global_y_from_local(y_end),
-      x_begin,
-      x_end,
-      y_begin,
-      y_end
-    );
-#endif // DEBUG
   }
 }
 
@@ -1034,82 +960,48 @@ static void setup_thread_tasks(void) {
 }
 
 static void worker_thread(void) {
-  ThreadTask *task = (ThreadTask*)ti->td;
-  double t0;
-
-  t0 = wall_time();
-  wait_phase_from_worker(init_fields_state());
-  task->t_wait_init += wall_time() - t0;
-  t0 = wall_time();
-  initialize_field_block(task);
-  task->t_work_init += wall_time() - t0;
-  finish_phase_from_worker(init_fields_state());
-
-  t0 = wall_time();
-  wait_phase_from_worker(initial_energy_state());
-  task->t_wait_energy0 += wall_time() - t0;
-  t0 = wall_time();
-  task->partial_energy = compute_energy_block(task);
-  task->t_work_energy0 += wall_time() - t0;
-  finish_phase_from_worker(initial_energy_state());
-
-  for (int step = 0; step < NT; step++) {
-    int compute_state = compute_phase_state(step);
-    int boundary_state = boundary_phase_state(step);
-    int energy_state = energy_phase_state(step);
-
-    t0 = wall_time();
-    wait_phase_from_worker(compute_state);
-    task->t_wait_compute += wall_time() - t0;
-    t0 = wall_time();
-    compute_interior_block(task);
-    task->t_work_compute += wall_time() - t0;
-    finish_phase_from_worker(compute_state);
-
-    t0 = wall_time();
-    wait_phase_from_worker(boundary_state);
-    task->t_wait_boundary += wall_time() - t0;
-    t0 = wall_time();
-    compute_boundary_block(task);
-    task->t_work_boundary += wall_time() - t0;
-    finish_phase_from_worker(boundary_state);
-
-    if (should_measure_energy_step(step)) {
-      t0 = wall_time();
-      wait_phase_from_worker(energy_state);
-      task->t_wait_energy += wall_time() - t0;
-      t0 = wall_time();
-      task->partial_energy = compute_energy_block(task);
-      task->t_work_energy += wall_time() - t0;
-      task->energy_steps += 1;
-      finish_phase_from_worker(energy_state);
-    }
+  int typ = uses_group_threads() ? 1 : 2;
+  while (!GetLocV(typ, SLOT_TP, NULL)) {
+    ntdelay(1);
   }
+  mt_taskpool_worker_loop(SLOT_TP);
 }
 
+static void submit_energy_tasks(int slot, GroupTaskPlan *plan) {
+  for (int i = 0; i < plan->n_tasks; i++)
+    mt_taskpool_submit(slot, task_compute_energy, &plan->tasks[i]);
+}
 
 static void group_main_thread(void) {
   ThreadTask *task = (ThreadTask*)ti->td;
+  int gid = ti->igrp;
+  GroupTaskPlan *plan = &g_group_plans[gid];
   double t0;
+
+  mt_taskpool_attach(SLOT_TP, TP_CAP, MT_TASKPOOL_BLOCK);
 
   t0 = wall_time();
   gWaitMain(init_fields_state());
   task->t_wait_init += wall_time() - t0;
-  gSetSubs(init_fields_state());
   t0 = wall_time();
-  gWaitSubs(init_fields_state());
-  task->t_wait_init += wall_time() - t0;
+  mt_taskpool_begin(SLOT_TP);
+  for (int i = 0; i < plan->n_tasks; i++)
+    mt_taskpool_submit(SLOT_TP, task_init_field, &plan->tasks[i]);
+  mt_taskpool_close(SLOT_TP);
+  mt_taskpool_wait(SLOT_TP);
+  task->t_work_init += wall_time() - t0;
   gSetMain(init_fields_state());
 
   t0 = wall_time();
   gWaitMain(initial_energy_state());
   task->t_wait_energy0 += wall_time() - t0;
-  gSetSubs(initial_energy_state());
   t0 = wall_time();
-  gWaitSubs(initial_energy_state());
-  task->t_wait_energy0 += wall_time() - t0;
-  t0 = wall_time();
-  g_group_energy[ti->igrp] = reduce_group_worker_energy(ti->igrp);
+  g_energy_acc = 0.0;
+  mt_taskpool_begin(SLOT_TP);
+  submit_energy_tasks(SLOT_TP, plan);
+  mt_taskpool_close(SLOT_TP);
+  mt_taskpool_wait(SLOT_TP);
+  g_group_energy[gid] = g_energy_acc;
   task->t_work_energy0 += wall_time() - t0;
   gSetMain(initial_energy_state());
 
@@ -1120,40 +1012,162 @@ static void group_main_thread(void) {
 
     t0 = wall_time();
     gWaitMain(compute_state);
-    double t1 = wall_time();
-    task->t_wait_compute += t1 - t0;
-    gSetSubs(compute_state);
-    t0 = wall_time();
-    gWaitSubs(compute_state);
-    task->t_recv += wall_time() - t1;
     task->t_wait_compute += wall_time() - t0;
+    t0 = wall_time();
+    mt_taskpool_begin(SLOT_TP);
+    for (int i = 0; i < plan->n_tasks; i++)
+      mt_taskpool_submit(SLOT_TP, task_compute_interior, &plan->tasks[i]);
+    mt_taskpool_close(SLOT_TP);
+    mt_taskpool_wait(SLOT_TP);
+    task->t_work_compute += wall_time() - t0;
     gSetMain(compute_state);
 
     t0 = wall_time();
     gWaitMain(boundary_state);
     task->t_wait_boundary += wall_time() - t0;
-    gSetSubs(boundary_state);
     t0 = wall_time();
-    gWaitSubs(boundary_state);
-    task->t_wait_boundary += wall_time() - t0;
+    mt_taskpool_begin(SLOT_TP);
+    for (int i = 0; i < plan->n_tasks; i++)
+      mt_taskpool_submit(SLOT_TP, task_compute_boundary, &plan->tasks[i]);
+    mt_taskpool_close(SLOT_TP);
+    mt_taskpool_wait(SLOT_TP);
+    task->t_work_boundary += wall_time() - t0;
     gSetMain(boundary_state);
 
     if (should_measure_energy_step(step)) {
       t0 = wall_time();
       gWaitMain(energy_state);
       task->t_wait_energy += wall_time() - t0;
-      gSetSubs(energy_state);
       t0 = wall_time();
-      gWaitSubs(energy_state);
-      task->t_wait_energy += wall_time() - t0;
-      t0 = wall_time();
-      g_group_energy[ti->igrp] = reduce_group_worker_energy(ti->igrp);
+      g_energy_acc = 0.0;
+      mt_taskpool_begin(SLOT_TP);
+      submit_energy_tasks(SLOT_TP, plan);
+      mt_taskpool_close(SLOT_TP);
+      mt_taskpool_wait(SLOT_TP);
+      g_group_energy[gid] = g_energy_acc;
       task->t_work_energy += wall_time() - t0;
       task->energy_steps += 1;
       gSetMain(energy_state);
     }
   }
-  printf("Group-Summary%d-%d: %.3f %.3f\n",mpi_id, ti->igrp, task->t_wait_compute, task->t_recv);
+
+  mt_taskpool_shutdown(SLOT_TP);
+  mt_taskpool_detach(SLOT_TP);
+  printf("Group-Summary%d-%d: %.3f %.3f\n", mpi_id, gid, task->t_wait_compute, task->t_work_compute);
+}
+
+static void pool_dispatch_flat(int slot, mt_task_fn fn) {
+  mt_taskpool_begin(slot);
+  for (int i = 0; i < g_n_flat_tasks; i++)
+    mt_taskpool_submit(slot, fn, &g_flat_tasks[i]);
+  mt_taskpool_close(slot);
+  mt_taskpool_wait(slot);
+}
+
+static void ungrouped_main(void) {
+  ThreadTask *task = (ThreadTask*)ti->td;
+  double start_time, local_energy = 0.0, global_energy = 0.0;
+  int current_halo_ready = 1;
+  double t0;
+
+  reset_task_timers(task);
+
+  mt_taskpool_attach(SLOT_TP, TP_CAP, MT_TASKPOOL_BLOCK);
+
+  t0 = wall_time();
+  pool_dispatch_flat(SLOT_TP, task_init_field);
+  task->t_wait_init += wall_time() - t0;
+
+  t0 = wall_time();
+  exchange_halos_for(g_sim.u_curr, task);
+  exchange_halos_for(g_sim.u_prev, task);
+  task->t_comm += wall_time() - t0;
+
+  t0 = wall_time();
+  g_energy_acc = 0.0;
+  pool_dispatch_flat(SLOT_TP, task_compute_energy);
+  local_energy = g_energy_acc;
+  task->t_wait_energy0 += wall_time() - t0;
+  t0 = wall_time();
+  MPI_Allreduce(&local_energy, &global_energy, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  task->t_allreduce += wall_time() - t0;
+  g_sim.initial_energy = global_energy;
+
+  if (mpi_id == 0) {
+    printf("[Main] Initial total energy: %.6f\n", g_sim.initial_energy);
+  }
+
+  start_time = MPI_Wtime();
+  double prev_time = start_time;
+
+  for (int step = 0; step < NT; step++) {
+    MPI_Barrier(MPI_COMM_WORLD);
+    int need_energy = should_measure_energy_step(step);
+    MPI_Request requests[8];
+    int request_count = 0;
+
+    t0 = wall_time();
+    if (!current_halo_ready) {
+      double t1 = wall_time();
+      begin_halo_exchange_for(g_sim.u_curr, requests, &request_count);
+      end_halo_exchange_for(g_sim.u_curr, requests, request_count, task);
+      task->t_comm += wall_time() - t1;
+      current_halo_ready = 1;
+    }
+    pool_dispatch_flat(SLOT_TP, task_compute_interior);
+    task->t_wait_compute += wall_time() - t0;
+
+    t0 = wall_time();
+    pool_dispatch_flat(SLOT_TP, task_compute_boundary);
+    task->t_wait_boundary += wall_time() - t0;
+
+    swap_fields();
+    current_halo_ready = 0;
+
+    if (need_energy) {
+      t0 = wall_time();
+      begin_halo_exchange_for(g_sim.u_curr, requests, &request_count);
+      end_halo_exchange_for(g_sim.u_curr, requests, request_count, task);
+      task->t_comm += wall_time() - t0;
+      current_halo_ready = 1;
+
+      t0 = wall_time();
+      g_energy_acc = 0.0;
+      pool_dispatch_flat(SLOT_TP, task_compute_energy);
+      local_energy = g_energy_acc;
+      task->t_wait_energy += wall_time() - t0;
+      t0 = wall_time();
+      MPI_Allreduce(&local_energy, &global_energy, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+      task->t_allreduce += wall_time() - t0;
+      task->energy_steps += 1;
+
+      if (mpi_id == 0) {
+        double rel_diff = (g_sim.initial_energy > 0.0)
+          ? fabs(global_energy - g_sim.initial_energy) / g_sim.initial_energy
+          : 0.0;
+        double cur_time = MPI_Wtime();
+        double compute_time = cur_time - prev_time;
+        prev_time = cur_time;
+        printf("[Main] Step %4d/%d, time %.3f,  Energy=%.6f  RelDiff=%.3e\n",
+               step + 1, NT, compute_time, global_energy, rel_diff);
+      }
+    }
+  }
+
+  mt_taskpool_shutdown(SLOT_TP);
+  mt_taskpool_detach(SLOT_TP);
+
+  double elapsed = MPI_Wtime() - start_time;
+  if (mpi_id == 0) {
+    double points = (double)NX * (double)NY * (double)NT;
+    printf("[Main] Simulation completed in %.3f seconds\n", elapsed);
+    printf("[Main] comm time: %.3f, recv tiem: %.3f, wait recv: %.3f, compute time: %.3f, boundary time: %.3f\n",
+            task->t_comm, task->t_recv, task->t_waitr, task->t_wait_compute, task->t_wait_boundary);
+    printf("[Main] comm package, localx %d , localy+HALO %d\n", g_sim.local_nx, g_sim.local_ny+HALO);
+    printf("[Main] Throughput: %.2f Mpoint-updates/s\n", points / elapsed / 1.0e6);
+  }
+  printf("Main-summary-%d: %d %d %.3f %.3f %.3f %.3f %.3f %.3f\n", mpi_id, g_sim.local_nx, g_sim.local_ny+HALO,
+         elapsed, task->t_comm, task->t_recv, task->t_waitr, task->t_wait_compute, task->t_wait_boundary);
 }
 
 static void main_thread(void) {
@@ -1290,10 +1304,9 @@ void thread_run(void) {
   }
 
   if (ti->igrp < 0) {
-    main_thread();
-  } else if (!uses_group_threads()) {
-    worker_thread();
-  } else if (ti->ind == 0) {
+    if (uses_group_threads()) main_thread();
+    else ungrouped_main();
+  } else if (uses_group_threads() && ti->ind == 0) {
     group_main_thread();
   } else {
     worker_thread();
@@ -1549,6 +1562,7 @@ int main(int argc,char **argv) {
 
   print_timing_report(mpi_rank, mpi_size, node_size);
 
+  free_task_plans();
   free_group_energy();
   free_simulation();
   MPI_Finalize();
