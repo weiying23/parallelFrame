@@ -1,5 +1,28 @@
 # NUMA 感知的线程组独立内存分配方案
 
+## 〇、架构分层
+
+本方案从底层到上层分为三个模块，逐个实现：
+
+```
+┌──────────────────────────────────────────────────┐
+│  应用层 (wave_propagation_ghost.c)                │
+│  使用 mythread_decomp + GroupField + halo 交换    │
+├──────────────────────────────────────────────────┤
+│  Layer 3: Halo 交换 (mythread_halo.h/.c)         │  ← 待实现
+│  intra_process_halo_exchange /                    │
+│  boundary_mpi_halo_exchange                       │
+├──────────────────────────────────────────────────┤
+│  Layer 2: NUMA 感知分配 (mythread_field.h/.c)     │  ← 待实现
+│  GroupField / group_alloc_field / numa_alloc      │
+├──────────────────────────────────────────────────┤
+│  Layer 1: 域分解 (mythread_decomp.h/.c)           │  ← ✅ 已实现
+│  group_tiles / worker_tiles / neighbor 拓扑       │
+└──────────────────────────────────────────────────┘
+```
+
+分层原则：每层只依赖下层，应用可以按需选用。不引入 NUMA 依赖的应用只用 Layer 1 做域分解即可。
+
 ## 一、背景与动机
 
 ### 1.1 当前问题
@@ -30,8 +53,9 @@ NUMA 0                          NUMA 1
 |------|------|
 | 线程组内的线程绑定到同一 NUMA 节点 | mythread 的 `initmd()` 已保证（通过 `indg` 连续分配） |
 | 线程组间无计算依赖 | 组间仅 halo 行有数据依赖，其他区域完全并行 |
-| 每组在 Y 方向覆盖进程子域的一个连续子区间 | `split_range` 已保证 |
-| 每组在 X 方向的覆盖范围 | 可配置：全部覆盖（Y_ONLY）或子区间覆盖（XY_2D），见 §1.4 |
+| 每组在 Y 方向覆盖进程子域的一个连续子区间 | `mythread_decomp` 保证 |
+| 每组在 X 方向的覆盖范围 | 可配置：全部覆盖（Y_ONLY）或子区间覆盖（XY_2D），见 `mythread_decomp.h` |
+| 组间邻居拓扑自动生成 | `mythread_decomp` 保证 |
 
 ### 1.3 设计目标
 
@@ -41,56 +65,9 @@ NUMA 0                          NUMA 1
 4. **MPI 通信收拢**：仅边界组参与 MPI 收发，内部组的组间 halo 走本地内存拷贝
 5. **代码向后兼容**：非 NUMA 平台（macOS / 未装 libnuma）降级为原始单一分配
 
-### 1.4 组间分解策略：Y_ONLY vs XY_2D
+### 1.4 域分解策略
 
-"每组是否覆盖 X 方向的全部进程子域" 不是硬约束，而是可配置的设计选择。
-
-**方案 Y_ONLY（仅 Y 方向切分，默认）**：
-
-```
-进程本地网格
-┌──────────────────────────────────────┐  ← 完整 X 范围 (local_nx)
-│  group 0   y: [HALO, y1)             │
-├──────────────────────────────────────┤
-│  group 1   y: [y1,   y2)             │
-├──────────────────────────────────────┤
-│  group 2   y: [y2,   ny+HALO)        │
-└──────────────────────────────────────┘
-```
-
-- 每组覆盖进程 **X 方向全部**，Y 方向一个连续子区间
-- 组间邻居：**最多 2 个**（上 Y / 下 Y）
-- 组间 halo：**2 次 memcpy / 组对**（仅 Y 方向）
-- 所有组都接触 X 边界 → 每个组都要参与 X 方向 MPI halo
-
-**方案 XY_2D（X 和 Y 方向都切分）**：
-
-```
-进程本地网格
-┌──────────────┬──────────────┐
-│  group 0     │  group 1     │  ← Y 区间 A
-│  x: [0, x1)  │  x: [x1, nx) │
-├──────────────┼──────────────┤
-│  group 2     │  group 3     │  ← Y 区间 B
-│  x: [0, x1)  │  x: [x1, nx) │
-└──────────────┴──────────────┘
-```
-
-- 每组覆盖进程 **X + Y 方向的一个矩形子域**
-- 组间邻居：**最多 4 个**（上/下/左/右）
-- 组间 halo：**4 次 memcpy / 组对**（X + Y 方向，以及角点一致性）
-- 仅边界组参与 MPI → MPI 通信总量更少
-
-**选择依据**：
-
-| 条件 | 推荐策略 |
-|------|----------|
-| 进程本地 `local_nx` 不大（< ~2000），或组数少（≤4） | Y_ONLY（halo 逻辑简单） |
-| `local_nx` 很大，Y 区间短 → 组间负载不均衡 | XY_2D（按 X 也切分） |
-| NUMA 节点间带宽充足 | Y_ONLY 够用 |
-| NUMA 节点间带宽紧张（> 2 组） | XY_2D 优先（减少跨 NUMA 通信面） |
-
-**设计原则**：两种策略使用**相同的 `GroupField` 结构体和代码路径**，仅在 `setup_thread_tasks` 中根据配置计算不同的 `x_begin_global/x_end_global` 和组邻居拓扑。halo 交换函数通过遍历邻居表统一处理，避免 if/else 分支蔓延。
+两种分解策略 `MYTHREAD_DECOMP_Y_ONLY` / `MYTHREAD_DECOMP_XY_2D` 已在 `mythread_decomp.h` 中定义。详细拓扑图、邻居数、选择依据参见该头文件的注释和 `mythread_decomp_create` 实现。本方案的上层模块（GroupField、halo 交换）通过 `mythread_decomp` 提供的 tile 和邻居拓扑统一处理，不区分策略。
 
 
 
@@ -101,65 +78,44 @@ NUMA 0                          NUMA 1
 ### 2.1 组级网格字段 `GroupField`
 
 ```c
-typedef struct {
-  /* ── 波场平面 ── */
+typedef struct GroupField {
+  /* ── 波场平面（每组独立分配）── */
   double *u_prev;              // (ny+2*HALO) * (nx+2*HALO)
   double *u_curr;
   double *u_next;
 
-  /* ── 尺寸 ── */
-  int ny_padded;               // = ny_group + 2*HALO（本组含 halo 的总行数）
-  int nx_padded;               // = nx_local  + 2*HALO（本组含 halo 的总列数）
+  /* ── 派生尺寸（从 mythread_tile 计算）── */
+  int ny_padded;               // = tile->ny + 2*HALO
+  int nx_padded;               // = tile->nx + 2*HALO
   int stride;                  // = nx_padded（idx 宏用）
-  int ny_interior;             // = ny_group（内部计算行数）
 
-  /* ── 全局坐标映射 ── */
-  int y_begin_global;          // 本组不含 halo 的第一行在全局网格中的 Y 坐标
-  int y_end_global;            // 本组不含 halo 的最后一行+1 的全局 Y 坐标
-  int x_begin_global;          // 本组不含 halo 的第一列在全局网格中的 X 坐标
-  int x_end_global;
-
-  /* ── 组间 halo 缓冲（Y 方向）── */
-  double *send_to_up;          // 向上组发送：本组最上一行内部数据（nx_local 个 double）
-  double *recv_from_up;        // 从上级接收：上级组的最下一行内部数据
-  double *send_to_down;        // 向下组发送：本组最下一行内部数据
+  /* ── 组间 halo 缓冲 ── */
+  double *send_to_up;          // 向上组发送：nx 个 double
+  double *recv_from_up;
+  double *send_to_down;
   double *recv_from_down;
-
-  /* ── 组间 halo 缓冲（X 方向，仅 XY_2D 模式使用）── */
-  double *send_to_left;        // 向左组发送：本组最左一列（ny_group 个 double）
+  double *send_to_left;        // 向左组发送：ny 个 double（仅 XY_2D）
   double *recv_from_left;
-  double *send_to_right;       // 向右组发送：本组最右一列
+  double *send_to_right;
   double *recv_from_right;
 
-  /* ── MPI halo 缓冲（X / Y 边界）── */
-  double *send_up;             // MPI 邻居 halo（仅边界组使用）
-  double *recv_up;
-  double *send_down;
-  double *recv_down;
-  double *send_left;
-  double *recv_left;
-  double *send_right;
-  double *recv_right;
+  /* ── MPI halo 缓冲（仅域边界组分配）── */
+  double *send_up, *recv_up;
+  double *send_down, *recv_down;
+  double *send_left, *recv_left;
+  double *send_right, *recv_right;
 
   /* ── NUMA 信息 ── */
-  int numa_node;               // 分配所在的 NUMA 节点
-  int is_boundary_top;         // 本组是否为进程的 Y 上边界组
-  int is_boundary_bottom;      // 本组是否为进程的 Y 下边界组
-  int neighbor_group_up;       // 相邻上组 ID（-1 表示无）
-  int neighbor_group_down;     // 相邻下组 ID（-1 表示无）
-  int neighbor_group_left;     // 相邻左组 ID（-1 表示无，仅 XY_2D）
-  int neighbor_group_right;    // 相邻右组 ID（-1 表示无，仅 XY_2D）
-
-  /* ── 分解模式 ── */
-  int decomp_y_only;           // 1 = Y_ONLY, 0 = XY_2D
-
-  /* ── 能量累加器 ── */
-  double group_energy;         // 本组内部能量（本组 worker 累加）
+  int numa_node;
+  double group_energy;         // 本组内部能量累加器
 } GroupField;
 
-/* 全局注册表，MMT 持有，所有组的 GMT 可读 */
-static GroupField *g_gfields = NULL;  /* [md.ngrp] */
+/* 全局注册表 + 关联的域分解 */
+static GroupField *g_gfields = NULL;      /* [md.ngrp] */
+static const mythread_decomp *g_decomp = NULL;  /* 指向域分解结果 */
 ```
+
+域信息（tile 范围、邻居拓扑、策略）全部由 `mythread_decomp` 提供，`GroupField` 只负责内存和 NUMA 绑定。使用时通过 `g_decomp->group_tiles[gid]` 获取本组子域范围。
 
 ### 2.2 `ThreadTask` 扩展
 
@@ -198,70 +154,62 @@ static double *g_mpi_x_recv = NULL;
 
 ```
 main()
-  ├─ init_simulation(mpi_rank, mpi_size)   ← 仅初始化拓扑、MPI 邻居
+  ├─ init_simulation(mpi_rank, mpi_size)        ← 仅初始化 MPI 拓扑
   ├─ InitThreads(...)
-  ├─ setup_thread_tasks()                   ← 确定每组 Y 范围
+  ├─ g_decomp = mythread_decomp_create(...)      ← Layer 1: 域分解
   ├─ StartThreads(thread_run)
   │
   └─ MMT: thread_run() → main_thread()
-       ├─ g_gfields = calloc(ngrp, sizeof(GroupField))   ← 分配注册表
+       ├─ g_gfields = calloc(ngrp, sizeof(GroupField))
        ├─ mSetGrps(init_fields_state)
        │
        └─ 各 GMT 并行执行：
             group_main_thread()
-              ├─ 【关键】此时 bindcpu 已完成，线程在目标 NUMA 节点上
-              ├─ group_alloc_field(gf, ny, nx)
+              ├─ 【关键】bindcpu 已完成，线程在目标 NUMA 节点
+              ├─ group_alloc_field(&g_gfields[gid], gid, g_decomp)
+              │    ├─ tile = &g_decomp->group_tiles[gid]
               │    ├─ numa_node = numa_node_of_cpu(sched_getcpu())
-              │    ├─ gf->u_prev = numa_alloc_onnode(plane*8, node)
-              │    ├─ gf->u_curr = numa_alloc_onnode(plane*8, node)
-              │    ├─ gf->u_next = numa_alloc_onnode(plane*8, node)
+              │    ├─ gf->u_prev/curr/next = numa_alloc_onnode(tile->nx, tile->ny, node)
               │    └─ halo bufs = numa_alloc_onnode(...)
-              └─ 初始化本组 u_curr / u_prev（first-touch 在同一 NUMA）
+              └─ 初始化本组波场（first-touch 在同一 NUMA）
 ```
 
 ### 3.2 分配函数
 
 ```c
-static int group_alloc_field(GroupField *gf, int ny_group, int nx_local,
-                              int y_begin_global, int y_end_global,
-                              int x_begin_global, int x_end_global,
-                              int neighbor_up, int neighbor_down) {
-  size_t plane = (size_t)(ny_group + 2 * HALO) * (size_t)(nx_local + 2 * HALO);
+static int group_alloc_field(GroupField *gf, int gid,
+                              const mythread_decomp *dc) {
+  const mythread_tile *tile = &dc->group_tiles[gid];
+  int ny = tile->ny, nx = tile->nx;
+  int halo = dc->halo;
+  size_t plane = (size_t)(ny + 2 * halo) * (size_t)(nx + 2 * halo);
   int node = numa_node_of_cpu(sched_getcpu());
 
-  gf->ny_padded  = ny_group + 2 * HALO;
-  gf->nx_padded  = nx_local + 2 * HALO;
-  gf->stride     = gf->nx_padded;
-  gf->ny_interior = ny_group;
-  gf->y_begin_global = y_begin_global;
-  gf->y_end_global   = y_end_global;
-  gf->x_begin_global = x_begin_global;
-  gf->x_end_global   = x_end_global;
-  gf->neighbor_group_up   = neighbor_up;
-  gf->neighbor_group_down = neighbor_down;
-  gf->numa_node  = node;
+  gf->ny_padded = ny + 2 * halo;
+  gf->nx_padded = nx + 2 * halo;
+  gf->stride    = gf->nx_padded;
+  gf->numa_node = node;
 
   gf->u_prev = numa_alloc_onnode(plane * sizeof(double), node);
   gf->u_curr = numa_alloc_onnode(plane * sizeof(double), node);
   gf->u_next = numa_alloc_onnode(plane * sizeof(double), node);
 
-  /* 组间 halo */
-  gf->send_to_up   = numa_alloc_onnode(nx_local * sizeof(double), node);
-  gf->recv_from_up = numa_alloc_onnode(nx_local * sizeof(double), node);
-  gf->send_to_down = numa_alloc_onnode(nx_local * sizeof(double), node);
-  gf->recv_from_down = numa_alloc_onnode(nx_local * sizeof(double), node);
+  /* 组间 halo — 按需分配 */
+  if (mythread_decomp_neighbor(dc, gid, MYTHREAD_NEIGHBOR_UP) >= 0) {
+    gf->recv_from_up = numa_alloc_onnode(nx * sizeof(double), node);
+  }
+  if (mythread_decomp_neighbor(dc, gid, MYTHREAD_NEIGHBOR_DOWN) >= 0) {
+    gf->recv_from_down = numa_alloc_onnode(nx * sizeof(double), node);
+  }
+  /* send_to_up/down 实际指向邻居的 recv_from_down/up，此处不额外分配；
+     由 MMT 在 setup 阶段将相邻组的缓冲指针互连 */
 
-  /* MPI halo — 仅边界组需要分配，内部组指针为 NULL */
-  if (gf->neighbor_group_up < 0) {
-    gf->send_up = numa_alloc_onnode(nx_local * sizeof(double), node);
-    gf->recv_up = numa_alloc_onnode(nx_local * sizeof(double), node);
+  /* MPI halo — 仅域边界组分配 */
+  if (mythread_decomp_is_domain_boundary(dc, gid, MYTHREAD_NEIGHBOR_UP)) {
+    gf->send_up = numa_alloc_onnode(nx * sizeof(double), node);
+    gf->recv_up = numa_alloc_onnode(nx * sizeof(double), node);
   }
-  if (gf->neighbor_group_down < 0) {
-    gf->send_down = numa_alloc_onnode(nx_local * sizeof(double), node);
-    gf->recv_down = numa_alloc_onnode(nx_local * sizeof(double), node);
-  }
-  /* X 方向所有组都可能有 MPI 邻居（NX 边界） */
-  /* ... send_left/right/recv_left/right 同理 ... */
+  /* ... down / left / right 同理 ... */
 
   return (gf->u_prev && gf->u_curr && gf->u_next) ? 0 : -1;
 }
@@ -423,74 +371,65 @@ MMT 主循环每步：
 
 ```c
 static void intra_process_halo_exchange(void) {
-  int g;
+  int halo = g_decomp->halo;
+  int ngrp  = g_decomp->n_groups;
 
-  /* ── 第一阶段：从源组拷贝数据到目标组的 recv 缓冲 ── */
-  for (g = 0; g < md.ngrp; g++) {
+  /* ── 第一阶段：拷贝源组数据到目标组的 recv 缓冲 ── */
+  for (int g = 0; g < ngrp; g++) {
     GroupField *gf = &g_gfields[g];
-    int nx_int = gf->nx_padded - 2 * HALO;
-    int ny_int = gf->ny_interior;
+    const mythread_tile *tile = &g_decomp->group_tiles[g];
+    int nx_int = tile->nx, ny_int = tile->ny;
 
-    /* Y 方向 — 所有模式都需要 */
-    if (gf->neighbor_group_up >= 0) {
-      GroupField *up = &g_gfields[gf->neighbor_group_up];
-      memcpy(up->recv_from_down,
-             &gf->u_curr[HALO * gf->stride + HALO],
+    /* Y 方向 */
+    int up = mythread_decomp_neighbor(g_decomp, g, MYTHREAD_NEIGHBOR_UP);
+    if (up >= 0) {
+      memcpy(g_gfields[up].recv_from_down,
+             &gf->u_curr[halo * gf->stride + halo],
              (size_t)nx_int * sizeof(double));
     }
-    if (gf->neighbor_group_down >= 0) {
-      GroupField *down = &g_gfields[gf->neighbor_group_down];
-      memcpy(down->recv_from_up,
-             &gf->u_curr[ny_int * gf->stride + HALO],
+    int down = mythread_decomp_neighbor(g_decomp, g, MYTHREAD_NEIGHBOR_DOWN);
+    if (down >= 0) {
+      memcpy(g_gfields[down].recv_from_up,
+             &gf->u_curr[ny_int * gf->stride + halo],
              (size_t)nx_int * sizeof(double));
     }
 
-    /* X 方向 — 仅 XY_2D 模式 */
-    if (!gf->decomp_y_only) {
-      if (gf->neighbor_group_left >= 0) {
-        GroupField *left = &g_gfields[gf->neighbor_group_left];
-        for (int row = 0; row < ny_int; row++) {
-          left->recv_from_right[row] = gf->u_curr[(HALO + row) * gf->stride + HALO];
-        }
-      }
-      if (gf->neighbor_group_right >= 0) {
-        GroupField *right = &g_gfields[gf->neighbor_group_right];
-        int src_col = HALO + nx_int - 1;
-        for (int row = 0; row < ny_int; row++) {
-          right->recv_from_left[row] = gf->u_curr[(HALO + row) * gf->stride + src_col];
-        }
-      }
+    /* X 方向（仅 XY_2D 有邻居） */
+    int left = mythread_decomp_neighbor(g_decomp, g, MYTHREAD_NEIGHBOR_LEFT);
+    if (left >= 0) {
+      for (int row = 0; row < ny_int; row++)
+        g_gfields[left].recv_from_right[row] = gf->u_curr[(halo + row) * gf->stride + halo];
+    }
+    int right = mythread_decomp_neighbor(g_decomp, g, MYTHREAD_NEIGHBOR_RIGHT);
+    if (right >= 0) {
+      int src_col = halo + nx_int - 1;
+      for (int row = 0; row < ny_int; row++)
+        g_gfields[right].recv_from_left[row] = gf->u_curr[(halo + row) * gf->stride + src_col];
     }
   }
 
-  /* ── 第二阶段：将接收缓冲拷贝到目标组的 halo 行/列 ── */
-  for (g = 0; g < md.ngrp; g++) {
+  /* ── 第二阶段：应用接收缓冲到目标 halo 行/列 ── */
+  for (int g = 0; g < ngrp; g++) {
     GroupField *gf = &g_gfields[g];
-    int nx_int = gf->nx_padded - 2 * HALO;
-    int ny_int = gf->ny_interior;
+    const mythread_tile *tile = &g_decomp->group_tiles[g];
+    int nx_int = tile->nx, ny_int = tile->ny;
 
-    if (gf->neighbor_group_up >= 0) {
-      memcpy(&gf->u_curr[0 * gf->stride + HALO],         // 上 halo 行
-             gf->recv_from_up,
+    if (mythread_decomp_neighbor(g_decomp, g, MYTHREAD_NEIGHBOR_UP) >= 0) {
+      memcpy(&gf->u_curr[0 * gf->stride + halo], gf->recv_from_up,
              (size_t)nx_int * sizeof(double));
     }
-    if (gf->neighbor_group_down >= 0) {
-      memcpy(&gf->u_curr[(ny_int + HALO) * gf->stride + HALO],  // 下 halo 行
-             gf->recv_from_down,
+    if (mythread_decomp_neighbor(g_decomp, g, MYTHREAD_NEIGHBOR_DOWN) >= 0) {
+      memcpy(&gf->u_curr[(ny_int + halo) * gf->stride + halo], gf->recv_from_down,
              (size_t)nx_int * sizeof(double));
     }
-    if (!gf->decomp_y_only) {
-      if (gf->neighbor_group_left >= 0) {
-        for (int row = 0; row < ny_int; row++) {
-          gf->u_curr[(HALO + row) * gf->stride + 0] = gf->recv_from_left[row];
-        }
-      }
-      if (gf->neighbor_group_right >= 0) {
-        int dst_col = HALO + nx_int;
-        for (int row = 0; row < ny_int; row++) {
-          gf->u_curr[(HALO + row) * gf->stride + dst_col] = gf->recv_from_right[row];
-        }
-      }
+    if (mythread_decomp_neighbor(g_decomp, g, MYTHREAD_NEIGHBOR_LEFT) >= 0) {
+      for (int row = 0; row < ny_int; row++)
+        gf->u_curr[(halo + row) * gf->stride + 0] = gf->recv_from_left[row];
+    }
+    if (mythread_decomp_neighbor(g_decomp, g, MYTHREAD_NEIGHBOR_RIGHT) >= 0) {
+      int dst_col = halo + nx_int;
+      for (int row = 0; row < ny_int; row++)
+        gf->u_curr[(halo + row) * gf->stride + dst_col] = gf->recv_from_right[row];
     }
   }
 }
@@ -542,36 +481,17 @@ static void boundary_mpi_halo_exchange(ThreadTask *task) {
 
 ### 5.4 分解配置与邻居拓扑构建
 
+域分解和邻居拓扑已由 `mythread_decomp_create` 统一完成。上层代码只需：
+
 ```c
-typedef enum { DECOMP_Y_ONLY = 0, DECOMP_XY_2D = 1 } GroupDecomp;
-
-static GroupDecomp g_group_decomp = DECOMP_Y_ONLY;  // 默认 Y_ONLY
-
-static void setup_group_decomposition(int ngroups) {
-  if (g_group_decomp == DECOMP_Y_ONLY) {
-    /* Y_ONLY 拓扑：线性链表 */
-    for (int g = 0; g < ngroups; g++) {
-      g_gfields[g].decomp_y_only = 1;
-      g_gfields[g].neighbor_group_up   = (g > 0)          ? (g - 1) : -1;
-      g_gfields[g].neighbor_group_down = (g < ngroups - 1) ? (g + 1) : -1;
-      g_gfields[g].neighbor_group_left  = -1;  /* 不适用 */
-      g_gfields[g].neighbor_group_right = -1;
-    }
-  } else {
-    /* XY_2D 拓扑：2D 网格 */
-    int gx = 1, gy = 1;
-    choose_group_grid(ngroups, &gx, &gy);  // 复用现有 choose_2d_grid
-    for (int g = 0; g < ngroups; g++) {
-      int gix = g % gx, giy = g / gx;
-      g_gfields[g].decomp_y_only = 0;
-      g_gfields[g].neighbor_group_up   = (giy > 0)        ? (g - gx) : -1;
-      g_gfields[g].neighbor_group_down = (giy < gy - 1)   ? (g + gx) : -1;
-      g_gfields[g].neighbor_group_left  = (gix > 0)        ? (g - 1)  : -1;
-      g_gfields[g].neighbor_group_right = (gix < gx - 1)   ? (g + 1)  : -1;
-    }
-  }
-}
+g_decomp = mythread_decomp_create(domain_nx, domain_ny, halo,
+                                   n_groups, n_workers_per_group,
+                                   MYTHREAD_DECOMP_Y_ONLY);
+// 查询邻居：mythread_decomp_neighbor(g_decomp, gid, MYTHREAD_NEIGHBOR_UP)
+// 查询 tile：g_decomp->group_tiles[gid]
 ```
+
+不再需要在应用或 GroupField 中手动构建邻居拓扑。
 
 ### 5.5 简化为：不拆阶段，并入现有 COMPUTE 阶段
 
@@ -617,9 +537,12 @@ static inline int global_y_from_local(int local_y) {
   return g_sim.local_y_begin + (local_y - HALO);
 }
 
-// 新版
-static inline int global_y_from_local(const GroupField *gf, int local_y) {
-  return gf->y_begin_global + (local_y - HALO);
+// 新版 — 通过 g_decomp 获取本组的全局偏移
+static inline int global_y_from_local(int gid, int local_y) {
+  return g_decomp->group_tiles[gid].y_begin + (local_y - g_decomp->halo);
+}
+static inline int global_x_from_local(int gid, int local_x) {
+  return g_decomp->group_tiles[gid].x_begin + (local_x - g_decomp->halo);
 }
 ```
 
@@ -673,16 +596,16 @@ Worker 的代码变更量最大（所有 `g_sim.u_*` 访问点），但变更模
 当 `ThreadG == 0`（非分组模式）时：
 
 ```c
-// 只有一个逻辑"组"：整个进程域
-g_gfields = calloc(1, sizeof(GroupField));
-group_alloc_field(&g_gfields[0],
-  g_sim.local_ny, g_sim.local_nx,
-  g_sim.local_y_begin, g_sim.local_y_end,
-  g_sim.local_x_begin, g_sim.local_x_end,
-  -1, -1);  // 无相邻组
+// 域分解：单一 tile 覆盖整个进程域
+g_decomp = mythread_decomp_create(g_sim.local_nx, g_sim.local_ny, HALO,
+                                   1,  // n_groups
+                                   g_sim.n_workers,  // worker 数
+                                   MYTHREAD_DECOMP_Y_ONLY);
 
-// 所有 worker 共享这一个 GroupField
-// 组间 halo 不触发（neighbor_up/down == -1）
+// 单组 GroupField，分配整个进程域
+g_gfields = calloc(1, sizeof(GroupField));
+group_alloc_field(&g_gfields[0], 0, g_decomp);
+// 组间 halo 不触发（无邻居）
 // MPI halo 正常执行
 ```
 
@@ -692,35 +615,41 @@ group_alloc_field(&g_gfields[0],
 
 ## 九、实施计划
 
-### 阶段一：引入 `GroupField`，不改计算路径（≈ 兼容过渡）
+### 阶段一：域分解（✅ 已完成）
 
-1. 定义 `GroupField` 结构体
+1. ✅ `mythread_decomp.h/.c` — 通用域分解 + 邻居拓扑
+2. ✅ 集成到 `mythread.h` 和 Makefile
+3. 后续：将 `wave_propagation_ghost.c` 中的 `split_range`/`choose_2d_grid` 替换为 `mythread_decomp_create`
+
+### 阶段二：引入 `GroupField`，不改计算路径（兼容过渡）
+
+1. 定义 `GroupField` 结构体 + `group_alloc_field`
 2. `init_simulation` 改为仅分配 MPI 拓扑信息
-3. 在 MMT 中分配 `g_gfields[1]`（单组），`GroupField` 指向原来的全局 `g_sim.u_*` 内存
-4. 所有计算路径通过 `GroupField*` 间接访问，但物理内存仍是进程共享的一块
+3. 在 MMT 中分配 `g_gfields[1]`（单组），指向原来的全局内存
+4. 所有计算路径通过 `GroupField*` 间接访问，物理内存仍是共享的
 5. 验证数值正确性无回归
 
-### 阶段二：真正的每组独立分配（组模式启用）
+### 阶段三：每组独立分配（组模式启用）
 
 1. 移除全局 `g_sim.u_prev/curr/next`
-2. GMT 在启动时调用 `group_alloc_field`
-3. 实现 MMT 集中式 `intra_process_halo_exchange`
-4. Worker 计算路径切换到 `ctx->gf->u_*`
-5. 验证组间 halo 正确（对比阶段一的单组结果）
+2. GMT 启动时调用 `group_alloc_field(gid, g_decomp)`
+3. 实现 MMT 集中式 `intra_process_halo_exchange` + `boundary_mpi_halo_exchange`
+4. Worker 计算路径切换到 `ctx->gf->u_*`、坐标转换使用 `g_decomp`
+5. 验证组间 halo 正确（对比阶段二的单组结果）
 
-### 阶段三：NUMA 感知分配
+### 阶段四：NUMA 感知分配
 
 1. 引入 `<numa.h>`（`#ifdef HAS_LIBNUMA`）
 2. `group_alloc_field` 改为 `numa_alloc_onnode`
 3. 增加 NUMA 节点信息输出
 4. 在 NUMA 机器上验证本地/远端访存比例
 
-### 阶段四：清理与优化
+### 阶段五：清理与优化
 
 1. 移除旧版全局 MPI halo buffer 的冗余分配
 2. `free_simulation` → `free_all_group_fields`
 3. 非组模式路径适配
-4. 更新文档
+4. 更新应用层代码
 
 ---
 

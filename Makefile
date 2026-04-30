@@ -9,8 +9,9 @@ MYTHREAD_SRC = mythread/mythread_util.c \
                mythread/mythread_pool.c \
                mythread/mythread_thread.c \
                mythread/mythread_fortran.c \
-               mythread/mythread_decomp.c
-TARGETS = wave_propagation wave_propagation_ghost tests/taskpool_tests mythread/test_bindcpu
+               mythread/mythread_decomp.c \
+               mythread/mythread_field.c
+TARGETS = wave_propagation wave_propagation_ghost tests/taskpool_tests mythread/test_bindcpu mythread/test_field
 
 .PHONY: all clean run_simple run_full run_wave run_ghost run_visual run_taskpool_tests run_bindcpu_tests debug
 
@@ -29,6 +30,9 @@ tests/taskpool_tests: tests/taskpool_tests.c $(MYTHREAD_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 mythread/test_bindcpu: mythread/test_bindcpu.c $(MYTHREAD_SRC)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+mythread/test_field: mythread/test_field.c $(MYTHREAD_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 wave_propagation: wave_propagation.c $(MYTHREAD_SRC)
@@ -70,6 +74,9 @@ run_taskpool_tests: tests/taskpool_tests
 
 run_bindcpu_tests: mythread/test_bindcpu
 	./mythread/test_bindcpu
+
+run_field_tests: mythread/test_field
+	./mythread/test_field
 
 visualize:
 	python3 visualize_wave.py --all
