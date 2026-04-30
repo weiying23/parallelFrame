@@ -8,7 +8,8 @@ MYTHREAD_SRC = mythread/mythread_util.c \
                mythread/mythread_sync.c \
                mythread/mythread_pool.c \
                mythread/mythread_thread.c \
-               mythread/mythread_fortran.c
+               mythread/mythread_fortran.c \
+               mythread/mythread_decomp.c
 TARGETS = wave_propagation wave_propagation_ghost tests/taskpool_tests mythread/test_bindcpu
 
 .PHONY: all clean run_simple run_full run_wave run_ghost run_visual run_taskpool_tests run_bindcpu_tests debug

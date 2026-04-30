@@ -9,5 +9,6 @@
 #include "mythread_pool.h"
 #include "mythread_thread.h"
 #include "mythread_fortran.h"
+#include "mythread_decomp.h"
 
 #endif
