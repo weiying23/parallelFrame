@@ -56,14 +56,16 @@ static void build_group_neighbors(mythread_decomp *dc) {
     int *nb = &dc->group_neighbors[g * MYTHREAD_NEIGHBOR_COUNT];
 
     if (dc->policy == MYTHREAD_DECOMP_Y_ONLY) {
-      nb[MYTHREAD_NEIGHBOR_UP]    = (g > 0)                ? (g - 1) : -1;
-      nb[MYTHREAD_NEIGHBOR_DOWN]  = (g < dc->n_groups - 1) ? (g + 1) : -1;
+      /* Y 方向物理语义: g 越大 → y 越大 → "上" */
+      nb[MYTHREAD_NEIGHBOR_UP]    = (g < dc->n_groups - 1) ? (g + 1) : -1;
+      nb[MYTHREAD_NEIGHBOR_DOWN]  = (g > 0)                ? (g - 1) : -1;
       nb[MYTHREAD_NEIGHBOR_LEFT]  = -1;
       nb[MYTHREAD_NEIGHBOR_RIGHT] = -1;
     } else {
       int gix = g % gx, giy = g / gx;
-      nb[MYTHREAD_NEIGHBOR_UP]    = (giy > 0)      ? (g - gx) : -1;
-      nb[MYTHREAD_NEIGHBOR_DOWN]  = (giy < gy - 1) ? (g + gx) : -1;
+      /* XY_2D: giy 越大 → y 越大 → "上" */
+      nb[MYTHREAD_NEIGHBOR_UP]    = (giy < gy - 1) ? (g + gx) : -1;
+      nb[MYTHREAD_NEIGHBOR_DOWN]  = (giy > 0)      ? (g - gx) : -1;
       nb[MYTHREAD_NEIGHBOR_LEFT]  = (gix > 0)      ? (g - 1)  : -1;
       nb[MYTHREAD_NEIGHBOR_RIGHT] = (gix < gx - 1) ? (g + 1)  : -1;
     }

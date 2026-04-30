@@ -174,14 +174,13 @@ static void test_boundary_mpi_buffers(void) {
   for (int g = 0; g < dc->n_groups; g++)
     group_alloc_field(&gfs[g], g, dc);
 
-  /* Y_ONLY 线性链：g=0 覆盖底部(y最小)，g=n-1 覆盖顶部(y最大)
-     g=0: 无 UP 邻居（域下边界，需 MPI 接收下方数据）→ send_up/recv_up
-     g=n-1: 无 DOWN 邻居（域上边界，需 MPI 接收上方数据）→ send_down/recv_down */
-  CHK(gfs[0].send_up != NULL && gfs[0].recv_up != NULL,
-      "Y-lower boundary group (g=0) missing MPI up buffers");
-  CHK(gfs[dc->n_groups - 1].send_down != NULL &&
-      gfs[dc->n_groups - 1].recv_down != NULL,
-      "Y-upper boundary group (g=n-1) missing MPI down buffers");
+  /* Y_ONLY: g=0 最下(y最小)→无DOWN邻居→需MPI下边界缓冲
+             g=n-1 最上(y最大)→无UP邻居→需MPI上边界缓冲 */
+  CHK(gfs[0].send_down != NULL && gfs[0].recv_down != NULL,
+      "Y-lower boundary group (g=0) missing MPI down buffers");
+  CHK(gfs[dc->n_groups - 1].send_up != NULL &&
+      gfs[dc->n_groups - 1].recv_up != NULL,
+      "Y-upper boundary group (g=n-1) missing MPI up buffers");
 
   /* 内部组不应有 Y 方向 MPI 缓冲 */
   for (int g = 1; g < dc->n_groups - 1; g++) {
@@ -214,8 +213,95 @@ static void test_single_group(void) {
   PASS();
 }
 
+/* ── TC-F09: intra halo 交换数据正确性 ── */
+static void test_halo_intra_correctness(void) {
+  TEST("halo-intra-correctness");
+  /* 3 组 Y_ONLY，每组 4x3，halo=1 → 含 halo: 6x5 */
+  mythread_decomp *dc = mythread_decomp_create(4, 9, 1, 3, 0,
+      MYTHREAD_DECOMP_Y_ONLY);
+  GroupField *gfs = calloc((size_t)dc->n_groups, sizeof(GroupField));
+  for (int g = 0; g < dc->n_groups; g++)
+    CHK(group_alloc_field(&gfs[g], g, dc) == 0, "alloc failed");
+  group_field_link_buffers(gfs, dc);
+
+  /* 每组填充不同的值：gf[g] 全部填 g+1 */
+  for (int g = 0; g < dc->n_groups; g++)
+    group_field_fill(&gfs[g], (double)(g + 1));
+
+  /* 执行组间 halo 交换 */
+  mythread_halo_exchange_intra(gfs, dc);
+
+  /* 验证：
+     gf[0]: 全部=1.0，上halo(行0)应来自 gf[1]=2.0，下halo 无邻居=保持1.0
+     gf[1]: 全部=2.0，上halo 来自 gf[2]=3.0，下halo 来自 gf[0]=1.0
+     gf[2]: 全部=3.0，上halo 无邻居=保持3.0，下halo 来自 gf[1]=2.0
+   */
+  int halo = dc->halo;
+  /* gf[0]: 上 halo 行应该变成 2.0（来自 gf[1] 的第一行内部数据=2.0） */
+  CHK(gfs[0].u_curr[GFIDX(&gfs[0], 0, halo)] == 2.0,
+      "gf[0] up-halo should be 2.0 from gf[1]");
+  /* gf[0]: 下 halo 行无人填充，保持 1.0 */
+  CHK(gfs[0].u_curr[GFIDX(&gfs[0], dc->group_tiles[0].ny + halo, halo)] == 1.0,
+      "gf[0] down-halo should stay 1.0 (no neighbor)");
+
+  /* gf[1]: 下 halo 行来自 gf[0] 的数据=1.0 */
+  CHK(gfs[1].u_curr[GFIDX(&gfs[1], dc->group_tiles[1].ny + halo, halo)] == 1.0,
+      "gf[1] down-halo should be 1.0 from gf[0]");
+  /* gf[1]: 上 halo 行来自 gf[2] 的数据=3.0 */
+  CHK(gfs[1].u_curr[GFIDX(&gfs[1], 0, halo)] == 3.0,
+      "gf[1] up-halo should be 3.0 from gf[2]");
+
+  /* gf[2]: 下 halo 来自 gf[1]=2.0 */
+  CHK(gfs[2].u_curr[GFIDX(&gfs[2], dc->group_tiles[2].ny + halo, halo)] == 2.0,
+      "gf[2] down-halo should be 2.0 from gf[1]");
+
+  for (int g = 0; g < dc->n_groups; g++) group_free_field(&gfs[g]);
+  free(gfs);
+  mythread_decomp_free(dc);
+  PASS();
+}
+
+/* ── TC-F10: intra halo XY_2D 四方向验证 ── */
+static void test_halo_intra_xy2d(void) {
+  TEST("halo-intra-xy2d");
+  /* 4 组 2x2，每组 3x3 内部，halo=1 → 含 halo: 5x5 */
+  mythread_decomp *dc = mythread_decomp_create(6, 6, 1, 4, 0,
+      MYTHREAD_DECOMP_XY_2D);
+  GroupField *gfs = calloc((size_t)dc->n_groups, sizeof(GroupField));
+  for (int g = 0; g < dc->n_groups; g++)
+    CHK(group_alloc_field(&gfs[g], g, dc) == 0, "alloc failed");
+  group_field_link_buffers(gfs, dc);
+
+  /* 每组填不同值 */
+  for (int g = 0; g < dc->n_groups; g++)
+    group_field_fill(&gfs[g], (double)(g + 10));
+
+  mythread_halo_exchange_intra(gfs, dc);
+
+  int halo = dc->halo;
+  /* XY_2D 2x2 grid: g0(左下), g1(右下), g2(左上), g3(右上)
+     g0: right=1(右), up=2(上), down=-1, left=-1
+       → 右 halo 来自 g1=11.0, 上 halo(row 0) 来自 g2=12.0 */
+  CHK(gfs[0].u_curr[GFIDX(&gfs[0], halo + 1, dc->group_tiles[0].nx + halo)] == 11.0,
+      "XY_2D gf[0] right-halo should be 11.0 from gf[1]");
+  CHK(gfs[0].u_curr[GFIDX(&gfs[0], 0, halo)] == 12.0,
+      "XY_2D gf[0] up-halo(row 0) should be 12.0 from gf[2]");
+
+  /* g3(右上): left=2(左), down=1(下), up=-1, right=-1
+       → 左 halo 来自 g2=12.0, 下 halo(row ny+halo) 来自 g1=11.0 */
+  CHK(gfs[3].u_curr[GFIDX(&gfs[3], halo, 0)] == 12.0,
+      "XY_2D gf[3] left-halo should be 12.0 from gf[2]");
+  CHK(gfs[3].u_curr[GFIDX(&gfs[3], dc->group_tiles[3].ny + halo, halo)] == 11.0,
+      "XY_2D gf[3] down-halo should be 11.0 from gf[1]");
+
+  for (int g = 0; g < dc->n_groups; g++) group_free_field(&gfs[g]);
+  free(gfs);
+  mythread_decomp_free(dc);
+  PASS();
+}
+
 int main(void) {
-  printf("\n=== mythread GroupField tests ===\n\n");
+  printf("\n=== mythread GroupField + Halo tests ===\n\n");
 
   test_alloc_free_y_only();
   test_alloc_free_xy2d();
@@ -225,6 +311,8 @@ int main(void) {
   test_repeated_alloc_free();
   test_boundary_mpi_buffers();
   test_single_group();
+  test_halo_intra_correctness();
+  test_halo_intra_xy2d();
 
   printf("\n=== Results: %d run, %d passed, %d failed ===\n",
          tests_run, tests_passed, tests_failed);

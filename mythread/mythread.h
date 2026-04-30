@@ -11,5 +11,6 @@
 #include "mythread_fortran.h"
 #include "mythread_decomp.h"
 #include "mythread_field.h"
+#include "mythread_halo.h"
 
 #endif
