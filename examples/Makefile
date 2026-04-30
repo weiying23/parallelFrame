@@ -8,7 +8,13 @@ LDFLAGS = -lpthread -lm
 TARGETS = example_simple example_mpi_mythread
 
 # 源文件
-MYTHREAD_SRC = ../mythread/mythread.c
+MYTHREAD_SRC = ../mythread/mythread_util.c \
+               ../mythread/mythread_locv.c \
+               ../mythread/mythread_timer.c \
+               ../mythread/mythread_sync.c \
+               ../mythread/mythread_pool.c \
+               ../mythread/mythread_thread.c \
+               ../mythread/mythread_fortran.c
 
 .PHONY: all clean
 

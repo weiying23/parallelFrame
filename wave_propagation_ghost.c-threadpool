@@ -22,13 +22,13 @@
  */
 
 #ifndef NX
-#define NX 1000
+#define NX 14000
 #endif
 #ifndef NY
-#define NY 1000
+#define NY 14000
 #endif
 #ifndef NT
-#define NT 480000
+#define NT 480
 #endif
 
 #ifndef A
@@ -36,7 +36,7 @@
 #endif
 
 #ifndef DT
-#define DT 0.01
+#define DT 0.001
 #endif
 #ifndef C0
 #define C0 0.1
@@ -76,7 +76,7 @@
 #define THREADS_PER_GROUP (N_WORKERS + 1)
 #endif
 #ifndef ENERGY_REPORT_INTERVAL
-#define ENERGY_REPORT_INTERVAL 1200
+#define ENERGY_REPORT_INTERVAL 60
 #endif
 
 #define DT2 (DT * DT)
@@ -140,7 +140,6 @@ typedef struct {
 typedef struct {
   int y_begin, y_end;
   int x_begin, x_end;
-  double *energy_acc;
 } RowTaskCtx;
 
 typedef struct {
@@ -847,12 +846,11 @@ static void task_compute_energy(void *ctx) {
   }
 
   double partial = 0.5 * (kinetic + C0 * C0 * (potential_x + potential_y)) * cell_area;
-  double *acc = c->energy_acc;
   union { double d; uint64_t i; } old, new;
   do {
-    old.d = *acc;
+    old.d = g_energy_acc;
     new.d = old.d + partial;
-  } while (!__sync_bool_compare_and_swap((volatile uint64_t*)acc, old.i, new.i));
+  } while (!__sync_bool_compare_and_swap((volatile uint64_t*)&g_energy_acc, old.i, new.i));
 }
 
 static double accumulate_worker_energy(void) {
@@ -909,7 +907,6 @@ static void setup_group_thread_tasks(void) {
       plan->tasks[i].y_end = cy_end;
       plan->tasks[i].x_begin = x_group_begin;
       plan->tasks[i].x_end = x_group_end;
-      plan->tasks[i].energy_acc = &g_group_energy[g];
     }
 
     for (int t = 0; t < pg->Nthreads; t++) {
@@ -939,7 +936,6 @@ static void setup_single_group_tasks(void) {
     g_flat_tasks[i].y_end = cy_end;
     g_flat_tasks[i].x_begin = HALO;
     g_flat_tasks[i].x_end = HALO + g_sim.local_nx;
-    g_flat_tasks[i].energy_acc = &g_energy_acc;
   }
 
   int worker_count = md.Nthreads - 1;
@@ -1000,11 +996,12 @@ static void group_main_thread(void) {
   gWaitMain(initial_energy_state());
   task->t_wait_energy0 += wall_time() - t0;
   t0 = wall_time();
-  g_group_energy[gid] = 0.0;
+  g_energy_acc = 0.0;
   mt_taskpool_begin(SLOT_TP);
   submit_energy_tasks(SLOT_TP, plan);
   mt_taskpool_close(SLOT_TP);
   mt_taskpool_wait(SLOT_TP);
+  g_group_energy[gid] = g_energy_acc;
   task->t_work_energy0 += wall_time() - t0;
   gSetMain(initial_energy_state());
 
@@ -1042,11 +1039,12 @@ static void group_main_thread(void) {
       gWaitMain(energy_state);
       task->t_wait_energy += wall_time() - t0;
       t0 = wall_time();
-      g_group_energy[gid] = 0.0;
+      g_energy_acc = 0.0;
       mt_taskpool_begin(SLOT_TP);
       submit_energy_tasks(SLOT_TP, plan);
       mt_taskpool_close(SLOT_TP);
       mt_taskpool_wait(SLOT_TP);
+      g_group_energy[gid] = g_energy_acc;
       task->t_work_energy += wall_time() - t0;
       task->energy_steps += 1;
       gSetMain(energy_state);
@@ -1553,11 +1551,10 @@ int main(int argc,char **argv) {
     return 1;
   }
 
+  setup_thread_tasks();
   if (uses_group_threads()) {
     g_group_energy = (double*)xcalloc((size_t)md.ngrp, sizeof(double));
   }
-
-  setup_thread_tasks();
 
   StartThreads(thread_run);
   thread_run();

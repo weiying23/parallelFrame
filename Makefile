@@ -2,10 +2,16 @@ CC = mpicc
 CFLAGS = -g -O2 -I.
 LDFLAGS = -lpthread -lm
 
-MYTHREAD_SRC = mythread/mythread.c
-TARGETS = wave_propagation wave_propagation_ghost tests/taskpool_tests
+MYTHREAD_SRC = mythread/mythread_util.c \
+               mythread/mythread_locv.c \
+               mythread/mythread_timer.c \
+               mythread/mythread_sync.c \
+               mythread/mythread_pool.c \
+               mythread/mythread_thread.c \
+               mythread/mythread_fortran.c
+TARGETS = wave_propagation wave_propagation_ghost tests/taskpool_tests mythread/test_bindcpu
 
-.PHONY: all clean run_simple run_full run_wave run_ghost run_visual run_taskpool_tests debug
+.PHONY: all clean run_simple run_full run_wave run_ghost run_visual run_taskpool_tests run_bindcpu_tests debug
 
 all: $(TARGETS)
 
@@ -21,6 +27,9 @@ example_taskpool: example_taskpool.c $(MYTHREAD_SRC)
 tests/taskpool_tests: tests/taskpool_tests.c $(MYTHREAD_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+mythread/test_bindcpu: mythread/test_bindcpu.c $(MYTHREAD_SRC)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 wave_propagation: wave_propagation.c $(MYTHREAD_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -31,7 +40,7 @@ wave_visual: wave_visual.c $(MYTHREAD_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 clean:
-	rm -f $(TARGETS) *.o *.txt *.bin *.png *.gif
+	rm -f $(TARGETS) *.o *.txt *.bin *.png *.gif mythread/*.o
 
 run_simple: example_simple
 	mpirun -np 2 ./example_simple
@@ -57,6 +66,9 @@ run_taskpool_tests: tests/taskpool_tests
 	mpirun -np 1 ./tests/taskpool_tests grouped-try-full
 	mpirun -np 1 ./tests/taskpool_tests ungrouped-basic
 	mpirun -np 1 ./tests/taskpool_tests boundary
+
+run_bindcpu_tests: mythread/test_bindcpu
+	./mythread/test_bindcpu
 
 visualize:
 	python3 visualize_wave.py --all

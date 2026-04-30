@@ -22,13 +22,13 @@
  */
 
 #ifndef NX
-#define NX 1000
+#define NX 14000
 #endif
 #ifndef NY
-#define NY 1000
+#define NY 14000
 #endif
 #ifndef NT
-#define NT 480000
+#define NT 480
 #endif
 
 #ifndef A
@@ -36,7 +36,7 @@
 #endif
 
 #ifndef DT
-#define DT 0.01
+#define DT 0.001
 #endif
 #ifndef C0
 #define C0 0.1
@@ -76,7 +76,7 @@
 #define THREADS_PER_GROUP (N_WORKERS + 1)
 #endif
 #ifndef ENERGY_REPORT_INTERVAL
-#define ENERGY_REPORT_INTERVAL 1200
+#define ENERGY_REPORT_INTERVAL 60
 #endif
 
 #define DT2 (DT * DT)
