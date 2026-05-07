@@ -20,68 +20,51 @@
  * - Worker 计算 tile 由 mythread_decomp 自动分配
  */
 
-#ifndef NX
-#define NX 14000
-#endif
-#ifndef NY
-#define NY 14000
-#endif
-#ifndef NT
-#define NT 480
-#endif
+/* ── 运行时参数（编译默认值 → config 文件 → 环境变量）── */
+static int    cfg_NX=14000, cfg_NY=14000, cfg_NT=480;
+static double cfg_A=10.0, cfg_DT=0.001, cfg_C0=0.1;
+static int    cfg_USE_FIXED_DOMAIN=0;
+static double cfg_DX, cfg_DY, cfg_LX, cfg_LY, cfg_DT2, cfg_CFL_X, cfg_CFL_Y, cfg_CFL_SUM2;
+static int    cfg_HALO=1, cfg_N_GROUPS=2, cfg_N_WORKERS=3, cfg_THREADS_PER_GROUP=4;
+static int    cfg_ENERGY_REPORT_INTERVAL=60, cfg_GROUP_DECOMP=0;
+static int    cfg_NCorePClu=5, cfg_NCluPNode=2, cfg_NCorePGrp=4, cfg_ManageCoreId=4;
 
-#ifndef A
-#define A 10.0
-#endif
+static void cfg_compute_derived(void) {
+  if (cfg_USE_FIXED_DOMAIN) {
+    cfg_LX = 1.0; cfg_LY = 1.0;
+    cfg_DX = cfg_LX / (double)(cfg_NX - 1);
+    cfg_DY = cfg_LY / (double)(cfg_NY - 1);
+  } else {
+    cfg_DX = 0.01; cfg_DY = 0.01;
+    cfg_LX = (cfg_NX - 1) * cfg_DX;
+    cfg_LY = (cfg_NY - 1) * cfg_DY;
+  }
+  cfg_DT2   = cfg_DT * cfg_DT;
+  cfg_CFL_X = cfg_C0 * cfg_DT / cfg_DX;
+  cfg_CFL_Y = cfg_C0 * cfg_DT / cfg_DY;
+  cfg_CFL_SUM2 = cfg_CFL_X * cfg_CFL_X + cfg_CFL_Y * cfg_CFL_Y;
+  cfg_THREADS_PER_GROUP = cfg_N_WORKERS + 1;
+}
 
-#ifndef DT
-#define DT 0.001
-#endif
-#ifndef C0
-#define C0 0.1
-#endif
+/* 便捷宏（引用运行时变量） */
+#define NX    cfg_NX
+#define NY    cfg_NY
+#define NT    cfg_NT
+#define A     cfg_A
+#define DT    cfg_DT
+#define C0    cfg_C0
+#define USE_FIXED_DOMAIN cfg_USE_FIXED_DOMAIN
+#define DX    cfg_DX
+#define DY    cfg_DY
+#define LX    cfg_LX
+#define LY    cfg_LY
+#define DT2   cfg_DT2
+#define CFL_X cfg_CFL_X
+#define CFL_Y cfg_CFL_Y
+#define CFL_SUM2 cfg_CFL_SUM2
+#define HALO  cfg_HALO
+#define ENERGY_REPORT_INTERVAL cfg_ENERGY_REPORT_INTERVAL
 
-#ifndef USE_FIXED_DOMAIN
-#define USE_FIXED_DOMAIN 0
-#endif
-
-#if USE_FIXED_DOMAIN
-#define LX 1.0
-#define LY 1.0
-#define DX (LX / (double)(NX - 1))
-#define DY (LY / (double)(NY - 1))
-#else
-#define DX 0.01
-#define DY 0.01
-#define LX ((NX - 1) * DX)
-#define LY ((NY - 1) * DY)
-#endif
-
-#ifndef HALO
-#define HALO 1
-#endif
-#ifndef N_GROUPS
-#define N_GROUPS 2
-#endif
-#ifndef N_WORKERS
-#define N_WORKERS 3
-#endif
-#ifndef THREADS_PER_GROUP
-#define THREADS_PER_GROUP (N_WORKERS + 1)
-#endif
-#ifndef ENERGY_REPORT_INTERVAL
-#define ENERGY_REPORT_INTERVAL 60
-#endif
-
-/* 域分解策略: 编译时可选 MYTHREAD_DECOMP_Y_ONLY 或 MYTHREAD_DECOMP_XY_2D */
-#ifndef GROUP_DECOMP
-#define GROUP_DECOMP MYTHREAD_DECOMP_Y_ONLY
-#endif
-
-#define DT2 (DT * DT)
-#define CFL_X (C0 * DT / DX)
-#define CFL_Y (C0 * DT / DY)
-#define CFL_SUM2 (CFL_X * CFL_X + CFL_Y * CFL_Y)
 
 /* ── 应用数据结构 ── */
 
@@ -564,18 +547,47 @@ static double reduce_group_worker_energy(int gid) {
   return e;
 }
 
+/* ── 配置加载 ── */
+static void cfg_load_from_files(const char *case_path, const char *hw_path) {
+  mythread_cfg *hw = mythread_cfg_load(hw_path);
+  mythread_cfg *cs = mythread_cfg_load(case_path);
+
+  cfg_NX  = cs ? mythread_cfg_get_int(cs, "", "NX",  cfg_NX)  : cfg_NX;
+  cfg_NY  = cs ? mythread_cfg_get_int(cs, "", "NY",  cfg_NY)  : cfg_NY;
+  cfg_NT  = cs ? mythread_cfg_get_int(cs, "", "NT",  cfg_NT)  : cfg_NT;
+  cfg_A   = cs ? mythread_cfg_get_double(cs, "", "A",  cfg_A)   : cfg_A;
+  cfg_DT  = cs ? mythread_cfg_get_double(cs, "", "DT", cfg_DT)  : cfg_DT;
+  cfg_C0  = cs ? mythread_cfg_get_double(cs, "", "C0", cfg_C0)  : cfg_C0;
+  cfg_USE_FIXED_DOMAIN = cs ? mythread_cfg_get_int(cs, "", "USE_FIXED_DOMAIN", cfg_USE_FIXED_DOMAIN) : cfg_USE_FIXED_DOMAIN;
+  cfg_HALO = cs ? mythread_cfg_get_int(cs, "", "HALO", cfg_HALO) : cfg_HALO;
+  cfg_ENERGY_REPORT_INTERVAL = cs ? mythread_cfg_get_int(cs, "", "ENERGY_REPORT_INTERVAL", cfg_ENERGY_REPORT_INTERVAL) : cfg_ENERGY_REPORT_INTERVAL;
+
+  cfg_N_GROUPS  = hw ? mythread_cfg_get_int(hw, "", "N_GROUPS",  cfg_N_GROUPS)  : cfg_N_GROUPS;
+  cfg_N_WORKERS = hw ? mythread_cfg_get_int(hw, "", "N_WORKERS", cfg_N_WORKERS) : cfg_N_WORKERS;
+  cfg_GROUP_DECOMP = hw ? mythread_cfg_get_int(hw, "", "GROUP_DECOMP", cfg_GROUP_DECOMP) : cfg_GROUP_DECOMP;
+  cfg_NCorePClu  = hw ? mythread_cfg_get_int(hw, "", "NCorePClu",  cfg_NCorePClu)  : cfg_NCorePClu;
+  cfg_NCluPNode  = hw ? mythread_cfg_get_int(hw, "", "NCluPNode",  cfg_NCluPNode)  : cfg_NCluPNode;
+  cfg_NCorePGrp  = hw ? mythread_cfg_get_int(hw, "", "NCorePGrp",  cfg_NCorePGrp)  : cfg_NCorePGrp;
+  cfg_ManageCoreId = hw ? mythread_cfg_get_int(hw, "", "ManageCoreId", cfg_ManageCoreId) : cfg_ManageCoreId;
+
+  mythread_cfg_free(cs);
+  mythread_cfg_free(hw);
+
+  /* 环境变量最高优先级 */
+
+  cfg_compute_derived();
+}
+
 /* ── 线程任务分配 ── */
 /* ── 负载不均衡配置（环境变量）── */
 static int g_imbalance_pct = 0;
 static int g_imbalance_worker = -1;
 
 static void parse_imbalance_config(void) {
-  const char *s = getenv("WAVE_IMBALANCE_PCT");
-  if (s) g_imbalance_pct = atoi(s);
-  if (g_imbalance_pct < 0) g_imbalance_pct = 0;
-  if (g_imbalance_pct > 200) g_imbalance_pct = 200;
-  s = getenv("WAVE_IMBALANCE_WORKER");
-  if (s) g_imbalance_worker = atoi(s);
+  /* 已由 cfg_load_from_files 通过 mythread_env_get_int 处理，
+     此处保留兼容性（直接读环境变量作为 fallback） */
+  g_imbalance_pct    = mythread_env_get_int("WAVE_IMBALANCE_PCT",    g_imbalance_pct);
+  g_imbalance_worker = mythread_env_get_int("WAVE_IMBALANCE_WORKER", g_imbalance_worker);
 }
 
 /*
@@ -1126,15 +1138,28 @@ static void print_timing_report(int mpi_rank, int mpi_size, int node_size) {
 
 int main(int argc, char **argv) {
   int mpi_rank, mpi_size;
-  int NCorePClu = 5, NCluPNode = 2, NCorePGrp = 4;
-  int NThPGrp = THREADS_PER_GROUP;
-  int NGrpPProc = N_GROUPS;
-  int NProcPNode = 1;
-  int ManageCoreId = 4;
+  int NCorePClu, NCluPNode, NCorePGrp;
+  int NThPGrp, NGrpPProc, NProcPNode = 1;
+  int ManageCoreId;
   int local_ready = 1, global_ready = 1;
   int err;
 
   MPI_Init(&argc, &argv);
+
+  /* 加载配置文件（config 目录相对于工作目录，可用环境变量覆盖路径） */
+  {
+    const char *cp = mythread_env_get("WAVE_CASE_CFG",    "config/case.cfg");
+    const char *hp = mythread_env_get("WAVE_HARDWARE_CFG","config/hardware.cfg");
+    cfg_load_from_files(cp, hp);
+  }
+
+  /* 使用配置值 */
+  NCorePClu  = cfg_NCorePClu;
+  NCluPNode  = cfg_NCluPNode;
+  NCorePGrp  = cfg_NCorePGrp;
+  NThPGrp    = cfg_THREADS_PER_GROUP;
+  NGrpPProc  = cfg_N_GROUPS;
+  ManageCoreId = cfg_ManageCoreId;
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
 
@@ -1180,7 +1205,7 @@ int main(int argc, char **argv) {
   /* ── 域分解 ── */
   int n_workers = uses_group_threads() ? (NThPGrp - 1) : (NThPGrp - 1);
   g_decomp = mythread_decomp_create(g_sim.local_nx, g_sim.local_ny, HALO,
-                                     NGrpPProc, n_workers, GROUP_DECOMP);
+                                     NGrpPProc, n_workers, cfg_GROUP_DECOMP);
   if (!g_decomp) {
     fprintf(stderr, "[Error] MPI=%d: decomp_create failed\n", mpi_rank);
     MPI_Finalize(); return 1;
@@ -1199,7 +1224,7 @@ int main(int argc, char **argv) {
     printf("MPI processes     : %d (%d x %d)\n",
            mpi_size, g_sim.proc_px, g_sim.proc_py);
     printf("Thread groups     : %d\n", NGrpPProc);
-    printf("Threads/group     : %d\n", THREADS_PER_GROUP);
+    printf("Threads/group     : %d\n", cfg_THREADS_PER_GROUP);
     printf("Group decomp      : %s\n",
            g_decomp->policy == MYTHREAD_DECOMP_Y_ONLY ? "Y_ONLY" : "XY_2D");
     printf("Group grid        : %d x %d\n", g_decomp->gx, g_decomp->gy);

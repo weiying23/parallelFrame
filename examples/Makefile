@@ -17,7 +17,8 @@ MYTHREAD_SRC = ../mythread/mythread_util.c \
                ../mythread/mythread_fortran.c \
                ../mythread/mythread_decomp.c \
                ../mythread/mythread_field.c \
-               ../mythread/mythread_halo.c
+               ../mythread/mythread_halo.c \
+               ../mythread/mythread_config.c
 
 .PHONY: all clean
 

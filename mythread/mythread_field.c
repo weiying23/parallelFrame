@@ -15,6 +15,16 @@
 #define HAS_LIBNUMA 0
 #endif
 
+/*
+ * sched_getcpu() 声明在 <sched.h>，需 _GNU_SOURCE。
+ * <numa.h> 可能间接引入，但不应依赖于此。
+ */
+#if HAS_LIBNUMA
+# if __has_include(<sched.h>)
+#  include <sched.h>
+# endif
+#endif
+
 /* ── 平台无关的分配包装 ── */
 static void *field_alloc(size_t bytes, int node) {
   if (bytes == 0) return NULL;

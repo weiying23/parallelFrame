@@ -12,5 +12,6 @@
 #include "mythread_decomp.h"
 #include "mythread_field.h"
 #include "mythread_halo.h"
+#include "mythread_config.h"
 
 #endif
