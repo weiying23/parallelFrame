@@ -561,10 +561,77 @@ static double reduce_group_worker_energy(int gid) {
 }
 
 /* ── 线程任务分配 ── */
+/* ── 负载不均衡配置（环境变量）── */
+static int g_imbalance_pct = 0;
+static int g_imbalance_worker = -1;
+
+static void parse_imbalance_config(void) {
+  const char *s = getenv("WAVE_IMBALANCE_PCT");
+  if (s) g_imbalance_pct = atoi(s);
+  if (g_imbalance_pct < 0) g_imbalance_pct = 0;
+  if (g_imbalance_pct > 200) g_imbalance_pct = 200;
+  s = getenv("WAVE_IMBALANCE_WORKER");
+  if (s) g_imbalance_worker = atoi(s);
+}
+
+/*
+ * 对一组 worker 施加 Y 方向的不均衡。
+ * 选定的 heavy worker 多承担 WAVE_IMBALANCE_PCT% 的行数，
+ * 其余 worker 均分剩余行。
+ */
+static void apply_imbalance_to_group(ThreadTask **workers, int nw) {
+  if (g_imbalance_pct <= 0 || nw < 2) return;
+
+  int big_id = (g_imbalance_worker >= 0 && g_imbalance_worker < nw)
+                 ? g_imbalance_worker : (nw - 1);
+
+  int total_rows = 0;
+  for (int w = 0; w < nw; w++)
+    total_rows += workers[w]->y_end - workers[w]->y_begin;
+
+  int avg = total_rows / nw;
+  int big_rows = avg + (avg * g_imbalance_pct) / 100;
+  if (big_rows >= total_rows) big_rows = total_rows - (nw - 1);
+  if (big_rows < 1) big_rows = 1;
+
+  int remaining = total_rows - big_rows;
+  int small_rows = remaining / (nw - 1);
+  int small_rem  = remaining % (nw - 1);
+
+  int y_cur = workers[0]->y_begin;
+  for (int w = 0; w < nw; w++) {
+    int rows;
+    if (w == big_id) {
+      rows = big_rows;
+    } else {
+      rows = small_rows + (small_rem > 0 ? 1 : 0);
+      if (small_rem > 0) small_rem--;
+    }
+    workers[w]->y_begin = y_cur;
+    workers[w]->y_end   = y_cur + rows;
+    y_cur += rows;
+  }
+  workers[nw - 1]->y_end = workers[0]->y_begin + total_rows;
+
+  if (mpi_id == 0) {
+    printf("[Imbalance] pct=%d heavy=%d total=%d heavy_rows=%d other_rows=%d\n",
+           g_imbalance_pct, big_id, total_rows, big_rows, small_rows);
+    for (int w = 0; w < nw; w++)
+      printf("  worker %d: y=[%d,%d) rows=%d\n",
+             w, workers[w]->y_begin, workers[w]->y_end,
+             workers[w]->y_end - workers[w]->y_begin);
+  }
+}
+
 static void setup_group_thread_tasks(void) {
+  parse_imbalance_config();
+
   for (int g = 0; g < g_decomp->n_groups; g++) {
     threadGroup *pg = md.grps[g];
     const mythread_tile *gtile = &g_decomp->group_tiles[g];
+    int nw = pg->Nthreads - 1;
+    ThreadTask **wtasks = (nw > 0)
+      ? (ThreadTask**)alloca((size_t)nw * sizeof(ThreadTask*)) : NULL;
 
     for (int t = 0; t < pg->Nthreads; t++) {
       ThreadTask *task = (ThreadTask*)pg->threads[t].td;
@@ -572,40 +639,69 @@ static void setup_group_thread_tasks(void) {
       task->tid = t;
       task->gf  = &g_gfields[g];
 
-      if (t == 0 || g_decomp->n_workers_per_group <= 0) {
-        /* GMT: 分配空 tile（GMT 不参与计算） */
+      if (t == 0 || nw <= 0) {
         task->x_begin = gtile->x_begin;
         task->x_end   = gtile->x_begin;
         task->y_begin = gtile->y_begin;
         task->y_end   = gtile->y_begin;
       } else {
-        const mythread_tile *wtile =
-          mythread_decomp_worker_tile(g_decomp, g, t - 1);
-        task->x_begin = wtile->x_begin;
-        task->x_end   = wtile->x_end;
-        task->y_begin = wtile->y_begin;
-        task->y_end   = wtile->y_end;
+        wtasks[t - 1] = task;
       }
       reset_task_timers(task);
+    }
+
+    /*
+     * 每组用实际 worker 数重新做 Y 方向切分。
+     * 不用 mythread_decomp 的 worker_tiles（它假设统一 worker 数），
+     * 因为 group 0 可能少一个 worker（MMT 占槽位）。
+     */
+    if (nw > 0) {
+      int total = gtile->ny;
+      int base  = total / nw;
+      int rem   = total % nw;
+      int y_cur = gtile->y_begin;
+      for (int w = 0; w < nw; w++) {
+        int rows = base + (w < rem ? 1 : 0);
+        wtasks[w]->x_begin = gtile->x_begin;
+        wtasks[w]->x_end   = gtile->x_end;
+        wtasks[w]->y_begin = y_cur;
+        wtasks[w]->y_end   = y_cur + rows;
+        y_cur += rows;
+      }
+      apply_imbalance_to_group(wtasks, nw);
     }
   }
 }
 
 static void setup_single_group_tasks(void) {
-  if (g_decomp->n_workers_per_group <= 0) return;
-  for (int t = 0; t < g_decomp->n_workers_per_group; t++) {
+  parse_imbalance_config();
+
+  int nw = g_decomp->n_workers_per_group;
+  if (nw <= 0) return;
+  const mythread_tile *gtile = &g_decomp->group_tiles[0];
+
+  ThreadTask **wtasks = (ThreadTask**)alloca((size_t)nw * sizeof(ThreadTask*));
+
+  int total = gtile->ny;
+  int base  = total / nw;
+  int rem   = total % nw;
+  int y_cur = gtile->y_begin;
+
+  for (int t = 0; t < nw; t++) {
+    int rows = base + (t < rem ? 1 : 0);
     ThreadTask *task = (ThreadTask*)md.threads[t].td;
-    const mythread_tile *wtile =
-      mythread_decomp_worker_tile(g_decomp, 0, t);
     task->gid = 0;
     task->tid = t;
     task->gf  = &g_gfields[0];
-    task->x_begin = wtile->x_begin;
-    task->x_end   = wtile->x_end;
-    task->y_begin = wtile->y_begin;
-    task->y_end   = wtile->y_end;
+    task->x_begin = gtile->x_begin;
+    task->x_end   = gtile->x_end;
+    task->y_begin = y_cur;
+    task->y_end   = y_cur + rows;
+    y_cur += rows;
+    wtasks[t] = task;
     reset_task_timers(task);
   }
+  apply_imbalance_to_group(wtasks, nw);
 }
 
 static void setup_thread_tasks(void) {
@@ -758,6 +854,20 @@ static void group_main_thread(void) {
          wall_time() - task->t_wait_compute); /* rough work est */
 }
 
+/* Dirichlet 边界应用到所有组 */
+static void apply_dirichlet_all_groups(void) {
+  for (int g = 0; g < g_decomp->n_groups; g++) {
+    enforce_dirichlet_boundaries(&g_gfields[g], g);
+    zero_physical_y_boundaries(&g_gfields[g], g);
+  }
+}
+
+/* 复制 u_curr 到 u_prev（初始化后同步 halo） */
+static void copy_curr_to_prev_all_groups(void) {
+  for (int g = 0; g < g_decomp->n_groups; g++)
+    memcpy(g_gfields[g].u_prev, g_gfields[g].u_curr, g_gfields[g].plane_bytes);
+}
+
 static void main_thread(void) {
   ThreadTask *task = (ThreadTask*)ti->td;
   double start_time, local_energy, global_energy;
@@ -765,32 +875,34 @@ static void main_thread(void) {
 
   reset_task_timers(task);
 
-  /* ── Phase 0: 分配 GroupField ── */
+  /* Phase 0: alloc GroupField */
   if (!uses_group_threads()) {
-    /* 非组模式：MMT 自行分配唯一的 GroupField */
     group_alloc_field(&g_gfields[0], 0, g_decomp);
-    /* 也填充 worker 的 gf 指针（setup 阶段已设置，但确保一致性） */
     for (int t = 0; t < g_decomp->n_workers_per_group; t++) {
       ThreadTask *wt = (ThreadTask*)md.threads[t].td;
       wt->gf = &g_gfields[0];
     }
   }
 
-  /* 等待所有 GMT 完成 GroupField 分配 + 波场初始化 */
+  /* Wait for GMTs to alloc + workers to init fields */
   t0 = wall_time();
   start_phase_from_main(init_fields_state());
   wait_phase_from_main(init_fields_state());
   task->t_wait_init += wall_time() - t0;
 
-  /* 分配完成后 link 组间缓冲 */
   group_field_link_buffers(g_gfields, g_decomp);
 
-  /* halo exchange for initial fields (u_curr, u_prev) */
+  /* Dirichlet + halo exchange for u_curr */
+  apply_dirichlet_all_groups();
   t0 = wall_time();
   mythread_halo_exchange_intra(g_gfields, g_decomp);
   mythread_halo_exchange_mpi(g_gfields, g_decomp, &g_mpi_ctx,
                               (uintptr_t)MPI_COMM_WORLD);
+  apply_dirichlet_all_groups();
   task->t_comm += wall_time() - t0;
+
+  /* sync u_prev halos */
+  copy_curr_to_prev_all_groups();
 
   /* initial energy */
   t0 = wall_time();
@@ -819,11 +931,13 @@ static void main_thread(void) {
     int es = energy_phase_state(step);
     int need_energy = should_measure_energy_step(step);
 
-    /* ── halo 交换 ── */
+    /* Dirichlet + halo */
+    apply_dirichlet_all_groups();
     t0 = wall_time();
     mythread_halo_exchange_intra(g_gfields, g_decomp);
     mythread_halo_exchange_mpi(g_gfields, g_decomp, &g_mpi_ctx,
                                 (uintptr_t)MPI_COMM_WORLD);
+    apply_dirichlet_all_groups();
     task->t_comm += wall_time() - t0;
 
     /* ── compute interior ── */
@@ -843,11 +957,13 @@ static void main_thread(void) {
       group_field_swap(&g_gfields[g]);
 
     if (need_energy) {
-      /* energy 阶段需要 fresh halo */
+      /* energy needs fresh halo */
+      apply_dirichlet_all_groups();
       t0 = wall_time();
       mythread_halo_exchange_intra(g_gfields, g_decomp);
       mythread_halo_exchange_mpi(g_gfields, g_decomp, &g_mpi_ctx,
                                   (uintptr_t)MPI_COMM_WORLD);
+      apply_dirichlet_all_groups();
       task->t_comm += wall_time() - t0;
 
       t0 = wall_time();
