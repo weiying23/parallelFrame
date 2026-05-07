@@ -345,22 +345,26 @@ static void enforce_dirichlet_boundaries(GroupField *gf, int gid) {
       gf->u_curr[GFIDX(gf, y, x_col)] = 0.0;
   }
 
-  /* MPI X 边界 */
-  if (g_sim.neighbor_left < 0) {
+  /* MPI X halo — 仅当 MPI 无邻居 且 组在域边界时归零 */
+  if (g_sim.neighbor_left < 0 &&
+      mythread_decomp_is_domain_boundary(g_decomp, gid, MYTHREAD_NEIGHBOR_LEFT)) {
     for (int y = 0; y < height; y++)
       gf->u_curr[GFIDX(gf, y, 0)] = 0.0;
   }
-  if (g_sim.neighbor_right < 0) {
+  if (g_sim.neighbor_right < 0 &&
+      mythread_decomp_is_domain_boundary(g_decomp, gid, MYTHREAD_NEIGHBOR_RIGHT)) {
     int x_halo = HALO + tile->nx;
     for (int y = 0; y < height; y++)
       gf->u_curr[GFIDX(gf, y, x_halo)] = 0.0;
   }
 
-  /* MPI Y 边界 — 仅域边界组处理 */
-  if (mythread_decomp_is_domain_boundary(g_decomp, gid, MYTHREAD_NEIGHBOR_DOWN)) {
+  /* MPI Y halo — 仅当 MPI 无邻居 且 组在域边界时归零 */
+  if (g_sim.neighbor_down < 0 &&
+      mythread_decomp_is_domain_boundary(g_decomp, gid, MYTHREAD_NEIGHBOR_DOWN)) {
     memset(&gf->u_curr[0], 0, (size_t)stride * sizeof(double));
   }
-  if (mythread_decomp_is_domain_boundary(g_decomp, gid, MYTHREAD_NEIGHBOR_UP)) {
+  if (g_sim.neighbor_up < 0 &&
+      mythread_decomp_is_domain_boundary(g_decomp, gid, MYTHREAD_NEIGHBOR_UP)) {
     memset(&gf->u_curr[(tile->ny + HALO) * stride], 0,
            (size_t)stride * sizeof(double));
   }
@@ -659,11 +663,12 @@ static void setup_group_thread_tasks(void) {
       int total = gtile->ny;
       int base  = total / nw;
       int rem   = total % nw;
-      int y_cur = gtile->y_begin;
+      /* GroupField 内每组 interior 始终从 y=HALO, x=HALO 开始 */
+      int y_cur = HALO;
       for (int w = 0; w < nw; w++) {
         int rows = base + (w < rem ? 1 : 0);
-        wtasks[w]->x_begin = gtile->x_begin;
-        wtasks[w]->x_end   = gtile->x_end;
+        wtasks[w]->x_begin = HALO;
+        wtasks[w]->x_end   = HALO + gtile->nx;
         wtasks[w]->y_begin = y_cur;
         wtasks[w]->y_end   = y_cur + rows;
         y_cur += rows;
@@ -685,7 +690,7 @@ static void setup_single_group_tasks(void) {
   int total = gtile->ny;
   int base  = total / nw;
   int rem   = total % nw;
-  int y_cur = gtile->y_begin;
+  int y_cur = HALO;
 
   for (int t = 0; t < nw; t++) {
     int rows = base + (t < rem ? 1 : 0);
@@ -693,8 +698,8 @@ static void setup_single_group_tasks(void) {
     task->gid = 0;
     task->tid = t;
     task->gf  = &g_gfields[0];
-    task->x_begin = gtile->x_begin;
-    task->x_end   = gtile->x_end;
+    task->x_begin = HALO;
+    task->x_end   = HALO + gtile->nx;
     task->y_begin = y_cur;
     task->y_end   = y_cur + rows;
     y_cur += rows;
@@ -784,7 +789,11 @@ static void group_main_thread(void) {
   double t0;
 
   /* ── 分配本组 GroupField（此时已 bindcpu，NUMA 节点正确）── */
-  group_alloc_field(&g_gfields[gid], gid, g_decomp);
+  if (group_alloc_field(&g_gfields[gid], gid, g_decomp) != 0) {
+    fprintf(stderr, "[Error] MPI=%d GMT gid=%d: group_alloc_field failed\n",
+            mpi_id, gid);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
   task->gf = &g_gfields[gid];
 
   /* init fields */
@@ -877,7 +886,10 @@ static void main_thread(void) {
 
   /* Phase 0: alloc GroupField */
   if (!uses_group_threads()) {
-    group_alloc_field(&g_gfields[0], 0, g_decomp);
+    if (group_alloc_field(&g_gfields[0], 0, g_decomp) != 0) {
+      fprintf(stderr, "[Error] MPI=%d: group_alloc_field failed\n", mpi_id);
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
     for (int t = 0; t < g_decomp->n_workers_per_group; t++) {
       ThreadTask *wt = (ThreadTask*)md.threads[t].td;
       wt->gf = &g_gfields[0];

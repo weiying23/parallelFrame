@@ -23,15 +23,17 @@ void mythread_halo_exchange_intra(GroupField *gfields, const mythread_decomp *dc
 
     nb = mythread_decomp_neighbor(dc, g, MYTHREAD_NEIGHBOR_UP);
     if (nb >= 0 && gfields[nb].recv_from_down) {
+      /* g 的末行 → 上方邻居的 DOWN halo（邻居接收来自下方的数据） */
       memcpy(gfields[nb].recv_from_down,
-             &gf->u_curr[halo * gf->stride + halo],
+             &gf->u_curr[ny * gf->stride + halo],
              (size_t)nx * sizeof(double));
     }
 
     nb = mythread_decomp_neighbor(dc, g, MYTHREAD_NEIGHBOR_DOWN);
     if (nb >= 0 && gfields[nb].recv_from_up) {
+      /* g 的首行 → 下方邻居的 UP halo（邻居接收来自上方的数据） */
       memcpy(gfields[nb].recv_from_up,
-             &gf->u_curr[ny * gf->stride + halo],
+             &gf->u_curr[halo * gf->stride + halo],
              (size_t)nx * sizeof(double));
     }
 
@@ -57,12 +59,16 @@ void mythread_halo_exchange_intra(GroupField *gfields, const mythread_decomp *dc
     const mythread_tile *tile = &dc->group_tiles[g];
     int nx = tile->nx, ny = tile->ny;
 
+    /*
+     * GroupField 坐标: y=0 映射到最小全局 Y(下方), y=ny+HALO 映射到最大全局 Y(上方)
+     * → recv_from_up(来自上方) 写入 row ny+HALO, recv_from_down(来自下方) 写入 row 0
+     */
     if (gf->recv_from_up) {
-      memcpy(&gf->u_curr[0 * gf->stride + halo], gf->recv_from_up,
+      memcpy(&gf->u_curr[(ny + halo) * gf->stride + halo], gf->recv_from_up,
              (size_t)nx * sizeof(double));
     }
     if (gf->recv_from_down) {
-      memcpy(&gf->u_curr[(ny + halo) * gf->stride + halo], gf->recv_from_down,
+      memcpy(&gf->u_curr[0 * gf->stride + halo], gf->recv_from_down,
              (size_t)nx * sizeof(double));
     }
     if (gf->recv_from_left) {

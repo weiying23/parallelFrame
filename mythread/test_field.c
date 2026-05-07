@@ -224,36 +224,53 @@ static void test_halo_intra_correctness(void) {
     CHK(group_alloc_field(&gfs[g], g, dc) == 0, "alloc failed");
   group_field_link_buffers(gfs, dc);
 
-  /* 每组填充不同的值：gf[g] 全部填 g+1 */
-  for (int g = 0; g < dc->n_groups; g++)
-    group_field_fill(&gfs[g], (double)(g + 1));
+  /* 每组填充不同的值，且组内首末行不同以验证方向:
+     gf[0]: 首行=10, 末行=11, 其余=1
+     gf[1]: 首行=20, 末行=21, 其余=2
+     gf[2]: 首行=30, 末行=31, 其余=3 */
+  group_field_fill(&gfs[0], 1.0);
+  group_field_fill(&gfs[1], 2.0);
+  group_field_fill(&gfs[2], 3.0);
+  /* 设置每组的首行 (y=HALO) 和末行 (y=ny) 为特殊值 */
+  {
+    int h = dc->halo;
+    for (int g = 0; g < dc->n_groups; g++) {
+      int ny = dc->group_tiles[g].ny;
+      for (int x = h; x < h + dc->group_tiles[g].nx; x++) {
+        gfs[g].u_curr[GFIDX(&gfs[g], h,      x)] = 10.0 * (g + 1);      /* 首行 */
+        gfs[g].u_curr[GFIDX(&gfs[g], ny,     x)] = 10.0 * (g + 1) + 1.0; /* 末行 */
+        gfs[g].u_curr[GFIDX(&gfs[g], ny + h, x)] = -1.0; /* 下halo(先写为-1) */
+        gfs[g].u_curr[GFIDX(&gfs[g], 0,      x)] = -1.0; /* 上halo(先写为-1) */
+      }
+    }
+  }
 
   /* 执行组间 halo 交换 */
   mythread_halo_exchange_intra(gfs, dc);
 
-  /* 验证：
-     gf[0]: 全部=1.0，上halo(行0)应来自 gf[1]=2.0，下halo 无邻居=保持1.0
-     gf[1]: 全部=2.0，上halo 来自 gf[2]=3.0，下halo 来自 gf[0]=1.0
-     gf[2]: 全部=3.0，上halo 无邻居=保持3.0，下halo 来自 gf[1]=2.0
+  /* 验证方向:
+     Row 0=下方halo(最小全局Y), Row ny+HALO=上方halo(最大全局Y)
+     g0(全局y=0..2) ↔ g1(全局y=3..5) ↔ g2(全局y=6..8)
+     g0 末行(11.0)→g1 下方halo(row 0)
+     g1 首行(20.0)→g0 上方halo(row ny+HALO)
+     g2 首行(30.0)→g1 上方halo(row ny+HALO)
+     g1 末行(21.0)→g2 下方halo(row 0)
    */
   int halo = dc->halo;
-  /* gf[0]: 上 halo 行应该变成 2.0（来自 gf[1] 的第一行内部数据=2.0） */
-  CHK(gfs[0].u_curr[GFIDX(&gfs[0], 0, halo)] == 2.0,
-      "gf[0] up-halo should be 2.0 from gf[1]");
-  /* gf[0]: 下 halo 行无人填充，保持 1.0 */
-  CHK(gfs[0].u_curr[GFIDX(&gfs[0], dc->group_tiles[0].ny + halo, halo)] == 1.0,
-      "gf[0] down-halo should stay 1.0 (no neighbor)");
+  /* gf[0]: 上方halo(row ny+HALO=4) 应来自 gf[1] 的首行=20.0 */
+  CHK(gfs[0].u_curr[GFIDX(&gfs[0], dc->group_tiles[0].ny + halo, halo)] == 20.0,
+      "gf[0] up-halo(row ny+1) should be 20.0 from gf[1] first row");
 
-  /* gf[1]: 下 halo 行来自 gf[0] 的数据=1.0 */
-  CHK(gfs[1].u_curr[GFIDX(&gfs[1], dc->group_tiles[1].ny + halo, halo)] == 1.0,
-      "gf[1] down-halo should be 1.0 from gf[0]");
-  /* gf[1]: 上 halo 行来自 gf[2] 的数据=3.0 */
-  CHK(gfs[1].u_curr[GFIDX(&gfs[1], 0, halo)] == 3.0,
-      "gf[1] up-halo should be 3.0 from gf[2]");
+  /* gf[1]: 下方halo(row 0) 应来自 gf[0] 的末行=11.0 */
+  CHK(gfs[1].u_curr[GFIDX(&gfs[1], 0, halo)] == 11.0,
+      "gf[1] down-halo(row 0) should be 11.0 from gf[0] last row");
+  /* gf[1]: 上方halo(row ny+HALO=4) 应来自 gf[2] 的首行=30.0 */
+  CHK(gfs[1].u_curr[GFIDX(&gfs[1], dc->group_tiles[1].ny + halo, halo)] == 30.0,
+      "gf[1] up-halo(row ny+1) should be 30.0 from gf[2] first row");
 
-  /* gf[2]: 下 halo 来自 gf[1]=2.0 */
-  CHK(gfs[2].u_curr[GFIDX(&gfs[2], dc->group_tiles[2].ny + halo, halo)] == 2.0,
-      "gf[2] down-halo should be 2.0 from gf[1]");
+  /* gf[2]: 下方halo(row 0) 应来自 gf[1] 的末行=21.0 */
+  CHK(gfs[2].u_curr[GFIDX(&gfs[2], 0, halo)] == 21.0,
+      "gf[2] down-halo(row 0) should be 21.0 from gf[1] last row");
 
   for (int g = 0; g < dc->n_groups; g++) group_free_field(&gfs[g]);
   free(gfs);
@@ -279,20 +296,21 @@ static void test_halo_intra_xy2d(void) {
   mythread_halo_exchange_intra(gfs, dc);
 
   int halo = dc->halo;
-  /* XY_2D 2x2 grid: g0(左下), g1(右下), g2(左上), g3(右上)
-     g0: right=1(右), up=2(上), down=-1, left=-1
-       → 右 halo 来自 g1=11.0, 上 halo(row 0) 来自 g2=12.0 */
+  /* XY_2D 2x2: g0(左下), g1(右下), g2(左上), g3(右上)
+     Row 0=下方halo, Row ny+HALO=上方halo
+     g0: right=1, up=2, down=-1, left=-1
+       → 右halo(col nx+HALO=4)=11.0, 上halo(row ny+HALO=4)=12.0 */
   CHK(gfs[0].u_curr[GFIDX(&gfs[0], halo + 1, dc->group_tiles[0].nx + halo)] == 11.0,
       "XY_2D gf[0] right-halo should be 11.0 from gf[1]");
-  CHK(gfs[0].u_curr[GFIDX(&gfs[0], 0, halo)] == 12.0,
-      "XY_2D gf[0] up-halo(row 0) should be 12.0 from gf[2]");
+  CHK(gfs[0].u_curr[GFIDX(&gfs[0], dc->group_tiles[0].ny + halo, halo)] == 12.0,
+      "XY_2D gf[0] up-halo(row ny+1) should be 12.0 from gf[2]");
 
-  /* g3(右上): left=2(左), down=1(下), up=-1, right=-1
-       → 左 halo 来自 g2=12.0, 下 halo(row ny+halo) 来自 g1=11.0 */
+  /* g3(右上): left=2, down=1, up=-1, right=-1
+       → 左halo(col 0)=12.0, 下halo(row 0)=11.0 */
   CHK(gfs[3].u_curr[GFIDX(&gfs[3], halo, 0)] == 12.0,
       "XY_2D gf[3] left-halo should be 12.0 from gf[2]");
-  CHK(gfs[3].u_curr[GFIDX(&gfs[3], dc->group_tiles[3].ny + halo, halo)] == 11.0,
-      "XY_2D gf[3] down-halo should be 11.0 from gf[1]");
+  CHK(gfs[3].u_curr[GFIDX(&gfs[3], 0, halo)] == 11.0,
+      "XY_2D gf[3] down-halo(row 0) should be 11.0 from gf[1]");
 
   for (int g = 0; g < dc->n_groups; g++) group_free_field(&gfs[g]);
   free(gfs);
