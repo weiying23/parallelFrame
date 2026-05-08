@@ -86,6 +86,7 @@ static void cfg_load_from_files(const char *case_path, const char *hw_path) {
 #define SLOT_TP 0
 #define TP_CAP 512
 #define CHUNK_ROWS 16
+#define CHUNK_COLS 256
 
 /* ── 数据结构 ── */
 typedef struct {
@@ -459,18 +460,25 @@ static void setup_group_thread_tasks(void) {
   for (int g=0; g<g_decomp->n_groups; g++) {
     const mythread_tile *gtile = &g_decomp->group_tiles[g];
     GroupField *gf = &g_gfields[g];
-    int n_rows = gtile->ny, n_chunks = (n_rows+CHUNK_ROWS-1)/CHUNK_ROWS;
+    int n_rows = gtile->ny, n_cols = gtile->nx;
+    int ny_chunks = (n_rows+CHUNK_ROWS-1)/CHUNK_ROWS;
+    int nx_chunks = (n_cols+CHUNK_COLS-1)/CHUNK_COLS;
     GroupTaskPlan *plan = &g_group_plans[g];
-    plan->n_tasks = n_chunks;
-    plan->tasks = (RowTaskCtx*)calloc((size_t)n_chunks, sizeof(*plan->tasks));
+    plan->n_tasks = ny_chunks * nx_chunks;
+    plan->tasks = (RowTaskCtx*)calloc((size_t)plan->n_tasks, sizeof(*plan->tasks));
     if (!plan->tasks) { fprintf(stderr,"alloc tasks failed\n"); MPI_Abort(MPI_COMM_WORLD,1); }
 
-    for (int i=0; i<n_chunks; i++) {
-      int cy = HALO + i*CHUNK_ROWS, cye = cy+CHUNK_ROWS;
+    for (int iy=0; iy<ny_chunks; iy++) {
+      int cy = HALO + iy*CHUNK_ROWS, cye = cy+CHUNK_ROWS;
       if (cye > HALO+n_rows) cye = HALO+n_rows;
-      plan->tasks[i].y_begin=cy; plan->tasks[i].y_end=cye;
-      plan->tasks[i].x_begin=HALO; plan->tasks[i].x_end=HALO+gtile->nx;
-      plan->tasks[i].gf = gf; plan->tasks[i].energy_acc = &gf->group_energy;
+      for (int ix=0; ix<nx_chunks; ix++) {
+        int cx = HALO + ix*CHUNK_COLS, cxe = cx+CHUNK_COLS;
+        if (cxe > HALO+n_cols) cxe = HALO+n_cols;
+        int idx = iy*nx_chunks + ix;
+        plan->tasks[idx].y_begin=cy; plan->tasks[idx].y_end=cye;
+        plan->tasks[idx].x_begin=cx; plan->tasks[idx].x_end=cxe;
+        plan->tasks[idx].gf = gf; plan->tasks[idx].energy_acc = &gf->group_energy;
+      }
     }
 
     threadGroup *pg = md.grps[g];
@@ -485,17 +493,25 @@ static void setup_group_thread_tasks(void) {
 }
 
 static void setup_single_group_tasks(void) {
-  int n_rows = g_decomp->group_tiles[0].ny, nw = g_decomp->n_workers_per_group;
-  g_n_flat_tasks = (n_rows+CHUNK_ROWS-1)/CHUNK_ROWS;
+  int n_rows = g_decomp->group_tiles[0].ny, n_cols = g_decomp->group_tiles[0].nx;
+  int nw = g_decomp->n_workers_per_group;
+  int ny_chunks = (n_rows+CHUNK_ROWS-1)/CHUNK_ROWS;
+  int nx_chunks = (n_cols+CHUNK_COLS-1)/CHUNK_COLS;
+  g_n_flat_tasks = ny_chunks * nx_chunks;
   g_flat_tasks = (RowTaskCtx*)calloc((size_t)g_n_flat_tasks, sizeof(*g_flat_tasks));
   if (!g_flat_tasks) { fprintf(stderr,"alloc flat tasks failed\n"); MPI_Abort(MPI_COMM_WORLD,1); }
   GroupField *gf = &g_gfields[0];
-  for (int i=0; i<g_n_flat_tasks; i++) {
-    int cy=HALO+i*CHUNK_ROWS, cye=cy+CHUNK_ROWS;
+  for (int iy=0; iy<ny_chunks; iy++) {
+    int cy=HALO+iy*CHUNK_ROWS, cye=cy+CHUNK_ROWS;
     if (cye>HALO+n_rows) cye=HALO+n_rows;
-    g_flat_tasks[i].y_begin=cy; g_flat_tasks[i].y_end=cye;
-    g_flat_tasks[i].x_begin=HALO; g_flat_tasks[i].x_end=HALO+g_decomp->group_tiles[0].nx;
-    g_flat_tasks[i].gf=gf; g_flat_tasks[i].energy_acc=&g_energy_acc;
+    for (int ix=0; ix<nx_chunks; ix++) {
+      int cx=HALO+ix*CHUNK_COLS, cxe=cx+CHUNK_COLS;
+      if (cxe>HALO+n_cols) cxe=HALO+n_cols;
+      int idx = iy*nx_chunks + ix;
+      g_flat_tasks[idx].y_begin=cy; g_flat_tasks[idx].y_end=cye;
+      g_flat_tasks[idx].x_begin=cx; g_flat_tasks[idx].x_end=cxe;
+      g_flat_tasks[idx].gf=gf; g_flat_tasks[idx].energy_acc=&g_energy_acc;
+    }
   }
   for (int t=0; t<nw; t++) {
     ThreadTask *task=(ThreadTask*)md.threads[t].td; task->gid=0; task->tid=t; task->gf=gf;
