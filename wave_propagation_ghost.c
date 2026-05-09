@@ -110,6 +110,7 @@ typedef struct {
 
 typedef struct {
   int y_begin, y_end, x_begin, x_end;
+  int gid;                     /* 所属组 id */
   GroupField *gf;
   double *energy_acc;
   double *l2_acc;
@@ -119,7 +120,7 @@ typedef struct {
 
 typedef struct {
   RowTaskCtx *tasks;
-  int n_tasks;
+  size_t n_tasks;
 } GroupTaskPlan;
 
 /* ── 全局变量 ── */
@@ -199,39 +200,53 @@ static int add_size_checked(size_t a, size_t b, size_t *out) {
 static int multiply_size_checked(size_t a, size_t b, size_t *out) {
   if (a != 0 && b > SIZE_MAX / a) return 0; *out = a * b; return 1;
 }
-static int estimate_rank_memory_bytes(size_t *plane_elems, size_t *rank_bytes) {
-  size_t fw, fh, fb, ftb, xb, yb, xtb, ytb, tb;
-  if (!add_size_checked((size_t)g_sim.local_nx, 2u*(size_t)HALO, &fw)) return 0;
-  if (!add_size_checked((size_t)g_sim.local_ny, 2u*(size_t)HALO, &fh)) return 0;
-  if (!multiply_size_checked(fh, fw, plane_elems)) return 0;
-  if (!multiply_size_checked(*plane_elems, sizeof(double), &fb)) return 0;
-  if (!multiply_size_checked(fb, 3u, &ftb)) return 0;
-  if (!multiply_size_checked((size_t)g_sim.local_nx, sizeof(double), &xb)) return 0;
-  if (!multiply_size_checked(fh, sizeof(double), &yb)) return 0;
-  if (!multiply_size_checked(xb, 4u, &xtb)) return 0;
-  if (!multiply_size_checked(yb, 4u, &ytb)) return 0;
-  if (!add_size_checked(ftb, xtb, &tb)) return 0;
-  return add_size_checked(tb, ytb, rank_bytes);
-}
-static int validate_memory_requirements(int mpi_rank, int node_size) {
-  size_t pe, rb, nb;
-  if (!estimate_rank_memory_bytes(&pe, &rb)) {
-    if (mpi_rank == 0) fprintf(stderr, "[Error] field size overflow\n");
-    return 0;
+static int validate_per_group_memory(int mpi_rank, int node_size,
+                                      const mythread_decomp *dc) {
+  size_t total = 0;
+  for (int g = 0; g < dc->n_groups; g++) {
+    const mythread_tile *t = &dc->group_tiles[g];
+    size_t pw, ph, plane, planes, halo_y, halo_x, mpi_bufs, gf_total;
+    if (!add_size_checked((size_t)t->nx, 2u*(size_t)dc->halo, &pw)) return 0;
+    if (!add_size_checked((size_t)t->ny, 2u*(size_t)dc->halo, &ph)) return 0;
+    if (!multiply_size_checked(ph, pw, &plane)) return 0;
+    if (!multiply_size_checked(plane, sizeof(double), &planes)) return 0;
+    if (!multiply_size_checked(planes, 3u, &planes)) return 0; /* 3 平面 */
+    if (!multiply_size_checked((size_t)t->nx, sizeof(double)*2, &halo_y)) return 0; /* send/recv Y */
+    if (!multiply_size_checked((size_t)t->ny, sizeof(double)*2, &halo_x)) return 0;
+    mpi_bufs = 0;
+    if (mythread_decomp_is_domain_boundary(dc, g, MYTHREAD_NEIGHBOR_UP))
+      { size_t b; multiply_size_checked((size_t)t->nx, sizeof(double)*2, &b); mpi_bufs += b; }
+    if (mythread_decomp_is_domain_boundary(dc, g, MYTHREAD_NEIGHBOR_DOWN))
+      { size_t b; multiply_size_checked((size_t)t->nx, sizeof(double)*2, &b); mpi_bufs += b; }
+    if (mythread_decomp_is_domain_boundary(dc, g, MYTHREAD_NEIGHBOR_LEFT))
+      { size_t b; multiply_size_checked((size_t)t->ny, sizeof(double)*2, &b); mpi_bufs += b; }
+    if (mythread_decomp_is_domain_boundary(dc, g, MYTHREAD_NEIGHBOR_RIGHT))
+      { size_t b; multiply_size_checked((size_t)t->ny, sizeof(double)*2, &b); mpi_bufs += b; }
+    if (!add_size_checked(planes, halo_y, &gf_total)) return 0;
+    if (!add_size_checked(gf_total, halo_x, &gf_total)) return 0;
+    if (!add_size_checked(gf_total, mpi_bufs, &gf_total)) return 0;
+    if (!add_size_checked(total, gf_total, &total)) return 0;
+  }
+  if (mpi_rank == 0) {
+    printf("Estimated rank memory: %.3f GiB (%d groups)\n",
+           (double)total/(1024.*1024.*1024.), dc->n_groups);
   }
   if (node_size < 1) node_size = 1;
-  if (!multiply_size_checked(rb, (size_t)node_size, &nb)) return 0;
-  if (mpi_rank == 0) {
-    printf("Estimated rank memory: %.3f GiB\n", (double)rb/(1024.*1024.*1024.));
+  size_t nb;
+  if (!multiply_size_checked(total, (size_t)node_size, &nb)) return 0;
+  if (mpi_rank == 0)
     printf("Estimated node memory: %.3f GiB (%d ranks/node)\n",
            (double)nb/(1024.*1024.*1024.), node_size);
-  }
 #if defined(__linux__)
   { struct sysinfo info;
     if (sysinfo(&info) == 0) {
       unsigned long long vis = (unsigned long long)info.totalram * (unsigned long long)info.mem_unit;
       if (mpi_rank == 0) printf("Visible node memory : %.3f GiB\n", (double)vis/(1024.*1024.*1024.));
-      if ((unsigned long long)nb > vis) { if (mpi_rank==0) fprintf(stderr,"[Error] memory exceeds visible\n"); return 0; }
+      if ((unsigned long long)nb > vis) {
+        if (mpi_rank==0) fprintf(stderr,"[Error] estimated %.3f GiB exceeds visible %.3f GiB\n",
+                                 (double)nb/(1024.*1024.*1024.), (double)vis/(1024.*1024.*1024.));
+        return 0;
+      }
     }
   }
 #endif
@@ -324,9 +339,7 @@ static void copy_curr_to_prev_all_groups(void) {
 
 /* ── 任务池回调（GroupField 版本）── */
 static void task_init_field(void *ctx) {
-  RowTaskCtx *c = (RowTaskCtx*)ctx; GroupField *gf = c->gf;
-  int gid = -1;
-  for (int g=0; g<g_decomp->n_groups; g++) if (&g_gfields[g]==gf) { gid=g; break; }
+  RowTaskCtx *c = (RowTaskCtx*)ctx; GroupField *gf = c->gf; int gid = c->gid;
   for (int y=c->y_begin; y<c->y_end; y++) {
     int gy = global_y_from_local(gid, y);
     for (int x=c->x_begin; x<c->x_end; x++) {
@@ -340,9 +353,7 @@ static void task_init_field(void *ctx) {
 }
 
 static void task_compute_interior(void *ctx) {
-  RowTaskCtx *c = (RowTaskCtx*)ctx; GroupField *gf = c->gf;
-  int gid = -1;
-  for (int g=0; g<g_decomp->n_groups; g++) if (&g_gfields[g]==gf) { gid=g; break; }
+  RowTaskCtx *c = (RowTaskCtx*)ctx; GroupField *gf = c->gf; int gid = c->gid;
   const mythread_tile *tile = &g_decomp->group_tiles[gid];
   int yb=c->y_begin, ye=c->y_end, xb=c->x_begin, xe=c->x_end;
 
@@ -367,9 +378,7 @@ static void task_compute_interior(void *ctx) {
 }
 
 static void task_compute_boundary(void *ctx) {
-  RowTaskCtx *c = (RowTaskCtx*)ctx; GroupField *gf = c->gf;
-  int gid = -1;
-  for (int g=0; g<g_decomp->n_groups; g++) if (&g_gfields[g]==gf) { gid=g; break; }
+  RowTaskCtx *c = (RowTaskCtx*)ctx; GroupField *gf = c->gf; int gid = c->gid;
   const mythread_tile *tile = &g_decomp->group_tiles[gid];
   int lr=HALO, ur=tile->ny, lc=HALO, rc=tile->nx;
   int xb=c->x_begin, xe=c->x_end, yb=c->y_begin, ye=c->y_end;
@@ -420,9 +429,7 @@ static void task_compute_boundary(void *ctx) {
 }
 
 static void task_compute_energy(void *ctx) {
-  RowTaskCtx *c = (RowTaskCtx*)ctx; GroupField *gf = c->gf;
-  int gid = -1;
-  for (int g=0; g<g_decomp->n_groups; g++) if (&g_gfields[g]==gf) { gid=g; break; }
+  RowTaskCtx *c = (RowTaskCtx*)ctx; GroupField *gf = c->gf; int gid = c->gid;
   const mythread_tile *tile = &g_decomp->group_tiles[gid];
   if (c->x_begin>=c->x_end || c->y_begin>=c->y_end) return;
   double ke=0.0, px=0.0, py=0.0, ca=DX*DY, l2=0.0, ma=0.0;
@@ -457,9 +464,15 @@ static void task_compute_energy(void *ctx) {
   do { old.d=*c->l2_acc; nw.d=old.d+l2; } while (!__sync_bool_compare_and_swap((volatile uint64_t*)c->l2_acc,old.i,nw.i));
 
   if (c->max_amp) {
-    do { old.d=*c->max_amp; if (ma <= old.d) break; nw.d=ma; }
-    while (!__sync_bool_compare_and_swap((volatile uint64_t*)c->max_amp,old.i,nw.i));
-    if (ma >= *c->max_amp) { *c->max_amp_gx = maxp.x; *c->max_amp_gy = maxp.y; }
+    for (;;) {
+      old.d = *c->max_amp;
+      if (ma <= old.d) break;
+      nw.d = ma;
+      if (__sync_bool_compare_and_swap((volatile uint64_t*)c->max_amp, old.i, nw.i)) {
+        *c->max_amp_gx = maxp.x; *c->max_amp_gy = maxp.y;
+        break;
+      }
+    }
   }
 }
 
@@ -501,22 +514,23 @@ static void setup_group_thread_tasks(void) {
     const mythread_tile *gtile = &g_decomp->group_tiles[g];
     GroupField *gf = &g_gfields[g];
     int n_rows = gtile->ny, n_cols = gtile->nx;
-    int ny_chunks = (n_rows+CHUNK_ROWS-1)/CHUNK_ROWS;
-    int nx_chunks = (n_cols+CHUNK_COLS-1)/CHUNK_COLS;
+    size_t ny_chunks = ((size_t)n_rows+CHUNK_ROWS-1)/CHUNK_ROWS;
+    size_t nx_chunks = ((size_t)n_cols+CHUNK_COLS-1)/CHUNK_COLS;
     GroupTaskPlan *plan = &g_group_plans[g];
     plan->n_tasks = ny_chunks * nx_chunks;
-    plan->tasks = (RowTaskCtx*)calloc((size_t)plan->n_tasks, sizeof(*plan->tasks));
+    plan->tasks = (RowTaskCtx*)calloc(plan->n_tasks, sizeof(*plan->tasks));
     if (!plan->tasks) { fprintf(stderr,"alloc tasks failed\n"); MPI_Abort(MPI_COMM_WORLD,1); }
 
-    for (int iy=0; iy<ny_chunks; iy++) {
-      int cy = HALO + iy*CHUNK_ROWS, cye = cy+CHUNK_ROWS;
+    for (size_t iy=0; iy<ny_chunks; iy++) {
+      int cy = HALO + (int)iy*CHUNK_ROWS, cye = cy+CHUNK_ROWS;
       if (cye > HALO+n_rows) cye = HALO+n_rows;
-      for (int ix=0; ix<nx_chunks; ix++) {
-        int cx = HALO + ix*CHUNK_COLS, cxe = cx+CHUNK_COLS;
+      for (size_t ix=0; ix<nx_chunks; ix++) {
+        int cx = HALO + (int)ix*CHUNK_COLS, cxe = cx+CHUNK_COLS;
         if (cxe > HALO+n_cols) cxe = HALO+n_cols;
-        int idx = iy*nx_chunks + ix;
+        size_t idx = iy*nx_chunks + ix;
         plan->tasks[idx].y_begin=cy; plan->tasks[idx].y_end=cye;
         plan->tasks[idx].x_begin=cx; plan->tasks[idx].x_end=cxe;
+        plan->tasks[idx].gid = g;
         plan->tasks[idx].gf = gf;
         plan->tasks[idx].energy_acc = &gf->group_energy;
         plan->tasks[idx].l2_acc = &g_group_l2[g];
@@ -540,21 +554,22 @@ static void setup_group_thread_tasks(void) {
 static void setup_single_group_tasks(void) {
   int n_rows = g_decomp->group_tiles[0].ny, n_cols = g_decomp->group_tiles[0].nx;
   int nw = g_decomp->n_workers_per_group;
-  int ny_chunks = (n_rows+CHUNK_ROWS-1)/CHUNK_ROWS;
-  int nx_chunks = (n_cols+CHUNK_COLS-1)/CHUNK_COLS;
-  g_n_flat_tasks = ny_chunks * nx_chunks;
+  size_t ny_chunks = ((size_t)n_rows+CHUNK_ROWS-1)/CHUNK_ROWS;
+  size_t nx_chunks = ((size_t)n_cols+CHUNK_COLS-1)/CHUNK_COLS;
+  g_n_flat_tasks = (int)(ny_chunks * nx_chunks);
   g_flat_tasks = (RowTaskCtx*)calloc((size_t)g_n_flat_tasks, sizeof(*g_flat_tasks));
   if (!g_flat_tasks) { fprintf(stderr,"alloc flat tasks failed\n"); MPI_Abort(MPI_COMM_WORLD,1); }
   GroupField *gf = &g_gfields[0];
-  for (int iy=0; iy<ny_chunks; iy++) {
-    int cy=HALO+iy*CHUNK_ROWS, cye=cy+CHUNK_ROWS;
+  for (size_t iy=0; iy<ny_chunks; iy++) {
+    int cy=HALO+(int)iy*CHUNK_ROWS, cye=cy+CHUNK_ROWS;
     if (cye>HALO+n_rows) cye=HALO+n_rows;
-    for (int ix=0; ix<nx_chunks; ix++) {
-      int cx=HALO+ix*CHUNK_COLS, cxe=cx+CHUNK_COLS;
+    for (size_t ix=0; ix<nx_chunks; ix++) {
+      int cx=HALO+(int)ix*CHUNK_COLS, cxe=cx+CHUNK_COLS;
       if (cxe>HALO+n_cols) cxe=HALO+n_cols;
-      int idx = iy*nx_chunks + ix;
+      size_t idx = iy*nx_chunks + ix;
       g_flat_tasks[idx].y_begin=cy; g_flat_tasks[idx].y_end=cye;
       g_flat_tasks[idx].x_begin=cx; g_flat_tasks[idx].x_end=cxe;
+      g_flat_tasks[idx].gid=0;
       g_flat_tasks[idx].gf=gf; g_flat_tasks[idx].energy_acc=&g_energy_acc;
       g_flat_tasks[idx].l2_acc=&g_l2_acc;
       g_flat_tasks[idx].max_amp=&g_max_amp;
@@ -586,7 +601,7 @@ static void free_task_plans(void) {
  * ═══════════════════════════════════════════════════════════════ */
 
 static void submit_energy_tasks(int slot, GroupTaskPlan *plan) {
-  for (int i=0; i<plan->n_tasks; i++)
+  for (size_t i=0; i<plan->n_tasks; i++)
     mt_taskpool_submit(slot, task_compute_energy, &plan->tasks[i]);
 }
 
@@ -616,7 +631,7 @@ static void group_main_thread(void) {
   t0=wall_time(); gWaitMain(init_fields_state()); task->t_wait_init+=wall_time()-t0;
   t0=wall_time();
   mt_taskpool_begin(slot);
-  for (int i=0; i<plan->n_tasks; i++) mt_taskpool_submit(slot, task_init_field, &plan->tasks[i]);
+  for (size_t i=0; i<plan->n_tasks; i++) mt_taskpool_submit(slot, task_init_field, &plan->tasks[i]);
   mt_taskpool_close(slot); mt_taskpool_wait(slot);
   task->t_work_init+=wall_time()-t0; gSetMain(init_fields_state());
 
@@ -632,14 +647,14 @@ static void group_main_thread(void) {
     t0=wall_time(); gWaitMain(cs); task->t_wait_compute+=wall_time()-t0;
     t0=wall_time();
     mt_taskpool_begin(slot);
-    for (int i=0; i<plan->n_tasks; i++) mt_taskpool_submit(slot, task_compute_interior, &plan->tasks[i]);
+    for (size_t i=0; i<plan->n_tasks; i++) mt_taskpool_submit(slot, task_compute_interior, &plan->tasks[i]);
     mt_taskpool_close(slot); mt_taskpool_wait(slot);
     task->t_work_compute+=wall_time()-t0; gSetMain(cs);
 
     t0=wall_time(); gWaitMain(bs); task->t_wait_boundary+=wall_time()-t0;
     t0=wall_time();
     mt_taskpool_begin(slot);
-    for (int i=0; i<plan->n_tasks; i++) mt_taskpool_submit(slot, task_compute_boundary, &plan->tasks[i]);
+    for (size_t i=0; i<plan->n_tasks; i++) mt_taskpool_submit(slot, task_compute_boundary, &plan->tasks[i]);
     mt_taskpool_close(slot); mt_taskpool_wait(slot);
     task->t_work_boundary+=wall_time()-t0; gSetMain(bs);
 
@@ -862,13 +877,15 @@ int main(int argc,char **argv) {
 
   init_simulation(mpi_rank,mpi_size);
   if (g_sim.local_nx<=0||g_sim.local_ny<=0) { fprintf(stderr,"[Error] invalid decomp\n"); local_ready=0; }
-  if (local_ready&&!validate_memory_requirements(mpi_rank,ns)) local_ready=0;
   MPI_Allreduce(&local_ready,&global_ready,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD);
   if (!global_ready) { free_simulation(); MPI_Finalize(); return 1; }
 
   g_decomp = mythread_decomp_create(g_sim.local_nx,g_sim.local_ny,HALO,NGrpPProc,
     uses_group_threads()?(NThPGrp-1):(NThPGrp-1),cfg_GROUP_DECOMP);
   if (!g_decomp) { fprintf(stderr,"[Error] decomp_create failed\n"); MPI_Finalize(); return 1; }
+  if (!validate_per_group_memory(mpi_rank, ns, g_decomp)) {
+    mythread_decomp_free((mythread_decomp*)g_decomp); g_decomp=NULL; MPI_Finalize(); return 1;
+  }
   g_gfields = (GroupField*)xcalloc((size_t)g_decomp->n_groups,sizeof(GroupField));
   g_group_l2   = (double*)xcalloc((size_t)g_decomp->n_groups,sizeof(double));
   g_group_max  = (double*)xcalloc((size_t)g_decomp->n_groups,sizeof(double));

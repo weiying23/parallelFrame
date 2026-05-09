@@ -187,41 +187,39 @@ static int multiply_size_checked(size_t a, size_t b, size_t *out) {
   *out = a * b; return 1;
 }
 
-static int estimate_rank_memory_bytes(size_t *plane_elems, size_t *rank_bytes) {
-  size_t fw, fh, fb, ftb, xb, yb, xtb, ytb, tb;
-  if (!add_size_checked((size_t)g_sim.local_nx, 2u * (size_t)HALO, &fw)) return 0;
-  if (!add_size_checked((size_t)g_sim.local_ny, 2u * (size_t)HALO, &fh)) return 0;
-  if (!multiply_size_checked(fh, fw, plane_elems)) return 0;
-  if (!multiply_size_checked(*plane_elems, sizeof(double), &fb)) return 0;
-  if (!multiply_size_checked(fb, 3u, &ftb)) return 0;
-  if (!multiply_size_checked((size_t)g_sim.local_nx, sizeof(double), &xb)) return 0;
-  if (!multiply_size_checked(fh, sizeof(double), &yb)) return 0;
-  if (!multiply_size_checked(xb, 4u, &xtb)) return 0;
-  if (!multiply_size_checked(yb, 4u, &ytb)) return 0;
-  if (!add_size_checked(ftb, xtb, &tb)) return 0;
-  if (!add_size_checked(tb, ytb, rank_bytes)) return 0;
-  return 1;
-}
-
-static int validate_memory_requirements(int mpi_rank, int node_size) {
-  size_t plane_elems, rank_bytes, node_bytes;
-  if (!estimate_rank_memory_bytes(&plane_elems, &rank_bytes)) {
-    if (mpi_rank == 0)
-      fprintf(stderr, "[Error] local field size overflows size_t\n");
-    return 0;
+static int validate_per_group_memory(int mpi_rank, int node_size,
+                                      const mythread_decomp *dc) {
+  size_t total = 0;
+  for (int g = 0; g < dc->n_groups; g++) {
+    const mythread_tile *t = &dc->group_tiles[g];
+    size_t pw, ph, plane_b, planes, halo_y, halo_x, mpi_bufs, gf_total;
+    if (!add_size_checked((size_t)t->nx, 2u*(size_t)dc->halo, &pw)) return 0;
+    if (!add_size_checked((size_t)t->ny, 2u*(size_t)dc->halo, &ph)) return 0;
+    if (!multiply_size_checked(ph, pw, &plane_b)) return 0;
+    if (!multiply_size_checked(plane_b, sizeof(double)*3, &planes)) return 0;
+    if (!multiply_size_checked((size_t)t->nx, sizeof(double)*2, &halo_y)) return 0;
+    if (!multiply_size_checked((size_t)t->ny, sizeof(double)*2, &halo_x)) return 0;
+    mpi_bufs = 0;
+    if (mythread_decomp_is_domain_boundary(dc, g, MYTHREAD_NEIGHBOR_UP))
+      { size_t b; multiply_size_checked((size_t)t->nx, sizeof(double)*2, &b); mpi_bufs += b; }
+    if (mythread_decomp_is_domain_boundary(dc, g, MYTHREAD_NEIGHBOR_DOWN))
+      { size_t b; multiply_size_checked((size_t)t->nx, sizeof(double)*2, &b); mpi_bufs += b; }
+    if (mythread_decomp_is_domain_boundary(dc, g, MYTHREAD_NEIGHBOR_LEFT))
+      { size_t b; multiply_size_checked((size_t)t->ny, sizeof(double)*2, &b); mpi_bufs += b; }
+    if (mythread_decomp_is_domain_boundary(dc, g, MYTHREAD_NEIGHBOR_RIGHT))
+      { size_t b; multiply_size_checked((size_t)t->ny, sizeof(double)*2, &b); mpi_bufs += b; }
+    if (!add_size_checked(planes, halo_y, &gf_total)) return 0;
+    if (!add_size_checked(gf_total, halo_x, &gf_total)) return 0;
+    if (!add_size_checked(gf_total, mpi_bufs, &gf_total)) return 0;
+    if (!add_size_checked(total, gf_total, &total)) return 0;
   }
+  if (mpi_rank == 0)
+    printf("Estimated rank memory: %.3f GiB (%d groups)\n", (double)total/(1024.*1024.*1024.), dc->n_groups);
   if (node_size < 1) node_size = 1;
-  if (!multiply_size_checked(rank_bytes, (size_t)node_size, &node_bytes)) {
-    if (mpi_rank == 0)
-      fprintf(stderr, "[Error] node-local memory estimate overflowed\n");
-    return 0;
-  }
-  if (mpi_rank == 0) {
-    printf("Estimated rank memory: %.3f GiB\n",
-           (double)rank_bytes / (1024.0 * 1024.0 * 1024.0));
-    printf("Estimated node memory: %.3f GiB (%d ranks/node)\n",
-           (double)node_bytes / (1024.0 * 1024.0 * 1024.0), node_size);
-  }
+  size_t nb;
+  if (!multiply_size_checked(total, (size_t)node_size, &nb)) return 0;
+  if (mpi_rank == 0)
+    printf("Estimated node memory: %.3f GiB (%d ranks/node)\n", (double)nb/(1024.*1024.*1024.), node_size);
 #if defined(__linux__)
   {
     struct sysinfo info;
@@ -231,7 +229,7 @@ static int validate_memory_requirements(int mpi_rank, int node_size) {
       if (mpi_rank == 0)
         printf("Visible node memory : %.3f GiB\n",
                (double)vis / (1024.0 * 1024.0 * 1024.0));
-      if ((unsigned long long)node_bytes > vis) {
+      if ((unsigned long long)nb > vis) {
         if (mpi_rank == 0)
           fprintf(stderr, "[Error] estimated memory exceeds visible memory\n");
         return 0;
@@ -1229,23 +1227,16 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[Error] MPI=%d: invalid decomposition\n", mpi_rank);
     local_ready = 0;
   }
-  if (local_ready && !validate_memory_requirements(mpi_rank, node_size))
-    local_ready = 0;
   MPI_Allreduce(&local_ready, &global_ready, 1, MPI_INT, MPI_MIN,
                 MPI_COMM_WORLD);
-  if (!global_ready) {
-    free_simulation();
-    MPI_Finalize();
-    return 1;
-  }
+  if (!global_ready) { free_simulation(); MPI_Finalize(); return 1; }
 
-  /* ── 域分解 ── */
   int n_workers = uses_group_threads() ? (NThPGrp - 1) : (NThPGrp - 1);
   g_decomp = mythread_decomp_create(g_sim.local_nx, g_sim.local_ny, HALO,
                                      NGrpPProc, n_workers, cfg_GROUP_DECOMP);
-  if (!g_decomp) {
-    fprintf(stderr, "[Error] MPI=%d: decomp_create failed\n", mpi_rank);
-    MPI_Finalize(); return 1;
+  if (!g_decomp) { fprintf(stderr, "[Error] decomp_create failed\n"); MPI_Finalize(); return 1; }
+  if (!validate_per_group_memory(mpi_rank, node_size, g_decomp)) {
+    mythread_decomp_free((mythread_decomp*)g_decomp); g_decomp=NULL; MPI_Finalize(); return 1;
   }
 
   /* ── 分配 GroupField 注册表（MMT 中填充）── */
