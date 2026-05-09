@@ -99,6 +99,9 @@ static SimulationData g_sim = {0};
 static GroupField *g_gfields = NULL;
 static const mythread_decomp *g_decomp = NULL;
 static mythread_mpi_ctx g_mpi_ctx = {0};
+static double *g_group_l2   = NULL;
+static double *g_group_max  = NULL;
+static int    *g_group_max_x = NULL, *g_group_max_y = NULL;
 
 int _gettdsize_() { return (int)sizeof(ThreadTask); }
 int _getgdsize_() { return 0; }
@@ -482,12 +485,17 @@ static void compute_boundary_block(GroupField *gf, int gid,
 
 static double compute_energy_block(GroupField *gf, int gid,
                                     int y_begin, int y_end,
-                                    int x_begin, int x_end) {
-  if (x_begin >= x_end || y_begin >= y_end) return 0.0;
+                                    int x_begin, int x_end,
+                                    double *l2_out, double *max_out,
+                                    int *max_x, int *max_y) {
+  if (x_begin >= x_end || y_begin >= y_end) {
+    if (l2_out) *l2_out=0.0; if (max_out) *max_out=0.0; return 0.0;
+  }
 
   const mythread_tile *tile = &g_decomp->group_tiles[gid];
-  double kinetic = 0.0, potential_x = 0.0, potential_y = 0.0;
+  double kinetic = 0.0, potential_x = 0.0, potential_y = 0.0, l2=0.0, ma=0.0;
   double cell_area = DX * DY;
+  int mx=0, my=0;
 
   int x_edge_begin = (x_begin == HALO) ? (HALO - 1) : x_begin;
   int x_edge_end = x_end;
@@ -495,6 +503,10 @@ static double compute_energy_block(GroupField *gf, int gid,
 
   for (int y = y_begin; y < y_end; y++) {
     int global_y = global_y_from_local(gid, y);
+    for (int x = x_begin; x < x_end; x++) {
+      double u = gf->u_curr[GFIDX(gf, y, x)]; l2 += u*u;
+      double au = fabs(u); if (au > ma) { ma=au; mx=global_x_from_local(gid,x); my=global_y; }
+    }
     if (global_y > 0 && global_y < NY - 1) {
       for (int x = x_begin; x < x_end; x++) {
         double ut = (gf->u_curr[GFIDX(gf, y, x)] -
@@ -519,6 +531,7 @@ static double compute_energy_block(GroupField *gf, int gid,
       }
     }
   }
+  if (l2_out) *l2_out=l2; if (max_out) *max_out=ma; if (max_x) *max_x=mx; if (max_y) *max_y=my;
   return 0.5 * (kinetic + C0 * C0 * (potential_x + potential_y)) * cell_area;
 }
 
@@ -545,6 +558,23 @@ static double reduce_group_worker_energy(int gid) {
     e += task->partial_energy;
   }
   return e;
+}
+
+static double accumulate_l2(void) {
+  double s = 0.0;
+  if (uses_group_threads()) { for (int g=0; g<g_decomp->n_groups; g++) s+=g_group_l2[g]; }
+  return sqrt(s * DX * DY);
+}
+static void reduce_max_amp(double *amp, int *gx, int *gy) {
+  *amp=0.0; *gx=*gy=0;
+  if (uses_group_threads()) {
+    for (int g=0; g<g_decomp->n_groups; g++)
+      if (g_group_max[g] > *amp) { *amp=g_group_max[g]; *gx=g_group_max_x[g]; *gy=g_group_max_y[g]; }
+  }
+}
+static void reset_group_metrics(int gid) {
+  g_gfields[gid].group_energy=0.0; g_group_l2[gid]=0.0;
+  g_group_max[gid]=0.0; g_group_max_x[gid]=g_group_max_y[gid]=0;
 }
 
 /* ── 配置加载 ── */
@@ -753,8 +783,12 @@ static void worker_thread(void) {
   wait_phase_from_worker(initial_energy_state());
   task->t_wait_energy0 += wall_time() - t0;
   t0 = wall_time();
+  double l2_,ma_; int mx_,my_;
   task->partial_energy = compute_energy_block(gf, gid,
-      task->y_begin, task->y_end, task->x_begin, task->x_end);
+      task->y_begin, task->y_end, task->x_begin, task->x_end,
+      &l2_, &ma_, &mx_, &my_);
+  g_group_l2[gid] += l2_;
+  if (ma_ > g_group_max[gid]) { g_group_max[gid]=ma_; g_group_max_x[gid]=mx_; g_group_max_y[gid]=my_; }
   task->t_work_energy0 += wall_time() - t0;
   finish_phase_from_worker(initial_energy_state());
 
@@ -786,8 +820,12 @@ static void worker_thread(void) {
       wait_phase_from_worker(es);
       task->t_wait_energy += wall_time() - t0;
       t0 = wall_time();
+      double l2__,ma__; int mx__,my__;
       task->partial_energy = compute_energy_block(gf, gid,
-          task->y_begin, task->y_end, task->x_begin, task->x_end);
+          task->y_begin, task->y_end, task->x_begin, task->x_end,
+          &l2__, &ma__, &mx__, &my__);
+      g_group_l2[gid] += l2__;
+      if (ma__ > g_group_max[gid]) { g_group_max[gid]=ma__; g_group_max_x[gid]=mx__; g_group_max_y[gid]=my__; }
       task->t_work_energy += wall_time() - t0;
       task->energy_steps += 1;
       finish_phase_from_worker(es);
@@ -941,9 +979,10 @@ static void main_thread(void) {
                 MPI_COMM_WORLD);
   task->t_allreduce += wall_time() - t0;
   g_sim.initial_energy = global_energy;
-
+  { double ma; int mx,my; reduce_max_amp(&ma,&mx,&my);
   if (mpi_id == 0)
-    printf("[Main] Initial total energy: %.6f\n", g_sim.initial_energy);
+    printf("[Main] Initial: E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",
+           g_sim.initial_energy, accumulate_l2(), ma, mx, my); }
 
   start_time = MPI_Wtime();
   double prev_time = start_time;
@@ -1004,14 +1043,12 @@ static void main_thread(void) {
       task->energy_steps += 1;
 
       if (mpi_id == 0) {
-        double rel_diff = (g_sim.initial_energy > 0.0)
-          ? fabs(global_energy - g_sim.initial_energy) / g_sim.initial_energy
-          : 0.0;
         double cur_time = MPI_Wtime();
         double compute_time = cur_time - prev_time;
         prev_time = cur_time;
-        printf("[Main] Step %4d/%d, time %.3f,  Energy=%.6f  RelDiff=%.3e\n",
-               step + 1, NT, compute_time, global_energy, rel_diff);
+        double ma; int mx, my; reduce_max_amp(&ma,&mx,&my);
+        printf("[Main] Step %4d/%d, time %.3f,  E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",
+               step + 1, NT, compute_time, global_energy, accumulate_l2(), ma, mx, my);
       }
     }
   }
@@ -1214,6 +1251,10 @@ int main(int argc, char **argv) {
   /* ── 分配 GroupField 注册表（MMT 中填充）── */
   g_gfields = (GroupField*)xcalloc((size_t)g_decomp->n_groups,
                                     sizeof(GroupField));
+  g_group_l2   = (double*)xcalloc((size_t)g_decomp->n_groups, sizeof(double));
+  g_group_max  = (double*)xcalloc((size_t)g_decomp->n_groups, sizeof(double));
+  g_group_max_x = (int*)xcalloc((size_t)g_decomp->n_groups, sizeof(int));
+  g_group_max_y = (int*)xcalloc((size_t)g_decomp->n_groups, sizeof(int));
 
   if (mpi_rank == 0) {
     printf("============================================\n");
