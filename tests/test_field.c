@@ -1,0 +1,338 @@
+#include "mythread/mythread.h"
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+static int tests_run = 0, tests_passed = 0, tests_failed = 0;
+
+#define TEST(n)  do { tests_run++; printf("  RUN  %s ... ", n); fflush(stdout); } while(0)
+#define PASS()   do { tests_passed++; printf("PASS\n"); } while(0)
+#define FAIL(m)  do { tests_failed++; printf("FAIL: %s\n", m); return; } while(0)
+#define CHK(c,m) do { if (!(c)) { FAIL(m); } } while(0)
+
+/* ── TC-F01: Y_ONLY 分解 + 分配 + 释放 ── */
+static void test_alloc_free_y_only(void) {
+  TEST("alloc-free-y-only");
+  mythread_decomp *dc = mythread_decomp_create(100, 200, 1, 4, 3,
+      MYTHREAD_DECOMP_Y_ONLY);
+  CHK(dc != NULL, "decomp_create failed");
+
+  GroupField *gfs = calloc((size_t)dc->n_groups, sizeof(GroupField));
+  CHK(gfs != NULL, "calloc gfs failed");
+
+  for (int g = 0; g < dc->n_groups; g++) {
+    int rc = group_alloc_field(&gfs[g], g, dc);
+    CHK(rc == 0, "group_alloc_field failed");
+    CHK(gfs[g].u_prev != NULL, "u_prev NULL");
+    CHK(gfs[g].u_curr != NULL, "u_curr NULL");
+    CHK(gfs[g].u_next != NULL, "u_next NULL");
+    CHK(gfs[g].stride == dc->group_tiles[g].nx + 2 * dc->halo, "stride mismatch");
+  }
+
+  group_field_link_buffers(gfs, dc);
+
+  /* 验证 Y 方向 send_to 指针互连 */
+  for (int g = 0; g < dc->n_groups; g++) {
+    int down = mythread_decomp_neighbor(dc, g, MYTHREAD_NEIGHBOR_DOWN);
+    if (down >= 0) {
+      CHK(gfs[g].send_to_down == gfs[down].recv_from_up,
+          "send_to_down not linked to neighbor recv_from_up");
+    }
+    int up = mythread_decomp_neighbor(dc, g, MYTHREAD_NEIGHBOR_UP);
+    if (up >= 0) {
+      CHK(gfs[g].send_to_up == gfs[up].recv_from_down,
+          "send_to_up not linked to neighbor recv_from_down");
+    }
+  }
+
+  for (int g = 0; g < dc->n_groups; g++) group_free_field(&gfs[g]);
+  free(gfs);
+  mythread_decomp_free(dc);
+  PASS();
+}
+
+/* ── TC-F02: XY_2D 分解 + 分配 + X 方向缓冲 ── */
+static void test_alloc_free_xy2d(void) {
+  TEST("alloc-free-xy2d");
+  mythread_decomp *dc = mythread_decomp_create(160, 120, 1, 4, 2,
+      MYTHREAD_DECOMP_XY_2D);
+  CHK(dc != NULL, "decomp_create failed");
+
+  GroupField *gfs = calloc((size_t)dc->n_groups, sizeof(GroupField));
+  CHK(gfs != NULL, "calloc gfs failed");
+
+  for (int g = 0; g < dc->n_groups; g++) {
+    CHK(group_alloc_field(&gfs[g], g, dc) == 0, "group_alloc_field failed");
+  }
+
+  group_field_link_buffers(gfs, dc);
+
+  /* 验证 X 方向缓冲存在（内部组应有 left/right 邻居） */
+  int has_left = 0, has_right = 0;
+  for (int g = 0; g < dc->n_groups; g++) {
+    if (mythread_decomp_neighbor(dc, g, MYTHREAD_NEIGHBOR_LEFT) >= 0) {
+      CHK(gfs[g].recv_from_left != NULL, "XY_2D recv_from_left NULL");
+      has_left++;
+    }
+    if (mythread_decomp_neighbor(dc, g, MYTHREAD_NEIGHBOR_RIGHT) >= 0) {
+      CHK(gfs[g].recv_from_right != NULL, "XY_2D recv_from_right NULL");
+      has_right++;
+    }
+  }
+  CHK(has_left > 0, "no group has left neighbor in XY_2D");
+  CHK(has_right > 0, "no group has right neighbor in XY_2D");
+
+  for (int g = 0; g < dc->n_groups; g++) group_free_field(&gfs[g]);
+  free(gfs);
+  mythread_decomp_free(dc);
+  PASS();
+}
+
+/* ── TC-F03: GFIDX 宏线性索引 ── */
+static void test_gfidx(void) {
+  TEST("gfidx-linear-index");
+  mythread_decomp *dc = mythread_decomp_create(10, 8, 2, 1, 0,
+      MYTHREAD_DECOMP_Y_ONLY);
+  GroupField gf;
+  CHK(group_alloc_field(&gf, 0, dc) == 0, "alloc failed");
+
+  /* 写一个已知值验证索引 */
+  gf.u_curr[GFIDX(&gf, 3, 5)] = 42.0;
+  CHK(gf.u_curr[GFIDX(&gf, 3, 5)] == 42.0, "GFIDX readback mismatch");
+
+  /* 二维排布：(y) * stride + x */
+  size_t expected = (size_t)3 * (size_t)gf.stride + (size_t)5;
+  CHK(GFIDX(&gf, 3, 5) == expected, "GFIDX formula mismatch");
+
+  group_free_field(&gf);
+  mythread_decomp_free(dc);
+  PASS();
+}
+
+/* ── TC-F04: field_fill + field_swap ── */
+static void test_fill_swap(void) {
+  TEST("fill-and-swap");
+  mythread_decomp *dc = mythread_decomp_create(10, 10, 1, 1, 0,
+      MYTHREAD_DECOMP_Y_ONLY);
+  GroupField gf;
+  group_alloc_field(&gf, 0, dc);
+
+  group_field_fill(&gf, 1.5);
+  CHK(gf.u_prev[GFIDX(&gf, 1, 1)] == 1.5, "fill prev failed");
+  CHK(gf.u_curr[GFIDX(&gf, 2, 3)] == 1.5, "fill curr failed");
+
+  /* 修改 curr，swap 后值应出现在 prev */
+  gf.u_curr[GFIDX(&gf, 0, 0)] = 99.0;
+  group_field_swap(&gf);
+  CHK(gf.u_prev[GFIDX(&gf, 0, 0)] == 99.0,  "swap: old curr not in prev");
+  CHK(gf.u_curr[GFIDX(&gf, 0, 0)] == 1.5,   "swap: old next not in curr");
+
+  group_free_field(&gf);
+  mythread_decomp_free(dc);
+  PASS();
+}
+
+/* ── TC-F05: NUMA 节点信息输出 ── */
+static void test_numa_info(void) {
+  TEST("numa-info");
+  mythread_decomp *dc = mythread_decomp_create(20, 20, 1, 2, 0,
+      MYTHREAD_DECOMP_Y_ONLY);
+  GroupField gfs[2];
+  for (int g = 0; g < 2; g++) {
+    CHK(group_alloc_field(&gfs[g], g, dc) == 0, "alloc failed");
+    /* numa_node 应为 -1（无 libnuma/macOS）或 ≥0（Linux+numa） */
+    CHK(gfs[g].numa_node >= -1, "numa_node out of range");
+  }
+  group_field_dump(&gfs[0], 0, stdout);
+  for (int g = 0; g < 2; g++) group_free_field(&gfs[g]);
+  mythread_decomp_free(dc);
+  PASS();
+}
+
+/* ── TC-F06: 重复 alloc/free 不泄漏 ── */
+static void test_repeated_alloc_free(void) {
+  TEST("repeated-alloc-free");
+  mythread_decomp *dc = mythread_decomp_create(30, 30, 1, 2, 1,
+      MYTHREAD_DECOMP_Y_ONLY);
+  for (int iter = 0; iter < 100; iter++) {
+    GroupField gf;
+    CHK(group_alloc_field(&gf, iter % 2, dc) == 0, "alloc failed in loop");
+    group_free_field(&gf);
+  }
+  mythread_decomp_free(dc);
+  PASS();
+}
+
+/* ── TC-F07: 域边界组分配 MPI halo 缓冲 ── */
+static void test_boundary_mpi_buffers(void) {
+  TEST("boundary-mpi-buffers");
+  mythread_decomp *dc = mythread_decomp_create(50, 100, 2, 4, 0,
+      MYTHREAD_DECOMP_Y_ONLY);
+  GroupField *gfs = calloc((size_t)dc->n_groups, sizeof(GroupField));
+
+  for (int g = 0; g < dc->n_groups; g++)
+    group_alloc_field(&gfs[g], g, dc);
+
+  /* Y_ONLY: g=0 最下(y最小)→无DOWN邻居→需MPI下边界缓冲
+             g=n-1 最上(y最大)→无UP邻居→需MPI上边界缓冲 */
+  CHK(gfs[0].send_down != NULL && gfs[0].recv_down != NULL,
+      "Y-lower boundary group (g=0) missing MPI down buffers");
+  CHK(gfs[dc->n_groups - 1].send_up != NULL &&
+      gfs[dc->n_groups - 1].recv_up != NULL,
+      "Y-upper boundary group (g=n-1) missing MPI up buffers");
+
+  /* 内部组不应有 Y 方向 MPI 缓冲 */
+  for (int g = 1; g < dc->n_groups - 1; g++) {
+    CHK(gfs[g].send_up == NULL && gfs[g].recv_up == NULL,
+        "internal group has unexpected MPI up buffers");
+    CHK(gfs[g].send_down == NULL && gfs[g].recv_down == NULL,
+        "internal group has unexpected MPI down buffers");
+  }
+
+  for (int g = 0; g < dc->n_groups; g++) group_free_field(&gfs[g]);
+  free(gfs);
+  mythread_decomp_free(dc);
+  PASS();
+}
+
+/* ── TC-F08: 单组模式（非分组兼容）── */
+static void test_single_group(void) {
+  TEST("single-group-mode");
+  mythread_decomp *dc = mythread_decomp_create(60, 80, 1, 1, 3,
+      MYTHREAD_DECOMP_Y_ONLY);
+  GroupField gf;
+  CHK(group_alloc_field(&gf, 0, dc) == 0, "alloc failed");
+  CHK(gf.send_to_up == NULL && gf.send_to_down == NULL,
+      "single group should have no intra-group neighbors");
+  /* 单组 = 全域边界 → MPI 缓冲应全部分配 */
+  CHK(gf.send_up && gf.send_down && gf.send_left && gf.send_right,
+      "single group missing MPI buffers");
+  group_free_field(&gf);
+  mythread_decomp_free(dc);
+  PASS();
+}
+
+/* ── TC-F09: intra halo 交换数据正确性 ── */
+static void test_halo_intra_correctness(void) {
+  TEST("halo-intra-correctness");
+  /* 3 组 Y_ONLY，每组 4x3，halo=1 → 含 halo: 6x5 */
+  mythread_decomp *dc = mythread_decomp_create(4, 9, 1, 3, 0,
+      MYTHREAD_DECOMP_Y_ONLY);
+  GroupField *gfs = calloc((size_t)dc->n_groups, sizeof(GroupField));
+  for (int g = 0; g < dc->n_groups; g++)
+    CHK(group_alloc_field(&gfs[g], g, dc) == 0, "alloc failed");
+  group_field_link_buffers(gfs, dc);
+
+  /* 每组填充不同的值，且组内首末行不同以验证方向:
+     gf[0]: 首行=10, 末行=11, 其余=1
+     gf[1]: 首行=20, 末行=21, 其余=2
+     gf[2]: 首行=30, 末行=31, 其余=3 */
+  group_field_fill(&gfs[0], 1.0);
+  group_field_fill(&gfs[1], 2.0);
+  group_field_fill(&gfs[2], 3.0);
+  /* 设置每组的首行 (y=HALO) 和末行 (y=ny) 为特殊值 */
+  {
+    int h = dc->halo;
+    for (int g = 0; g < dc->n_groups; g++) {
+      int ny = dc->group_tiles[g].ny;
+      for (int x = h; x < h + dc->group_tiles[g].nx; x++) {
+        gfs[g].u_curr[GFIDX(&gfs[g], h,      x)] = 10.0 * (g + 1);      /* 首行 */
+        gfs[g].u_curr[GFIDX(&gfs[g], ny,     x)] = 10.0 * (g + 1) + 1.0; /* 末行 */
+        gfs[g].u_curr[GFIDX(&gfs[g], ny + h, x)] = -1.0; /* 下halo(先写为-1) */
+        gfs[g].u_curr[GFIDX(&gfs[g], 0,      x)] = -1.0; /* 上halo(先写为-1) */
+      }
+    }
+  }
+
+  /* 执行组间 halo 交换 */
+  mythread_halo_exchange_intra(gfs, dc);
+
+  /* 验证方向:
+     Row 0=下方halo(最小全局Y), Row ny+HALO=上方halo(最大全局Y)
+     g0(全局y=0..2) ↔ g1(全局y=3..5) ↔ g2(全局y=6..8)
+     g0 末行(11.0)→g1 下方halo(row 0)
+     g1 首行(20.0)→g0 上方halo(row ny+HALO)
+     g2 首行(30.0)→g1 上方halo(row ny+HALO)
+     g1 末行(21.0)→g2 下方halo(row 0)
+   */
+  int halo = dc->halo;
+  /* gf[0]: 上方halo(row ny+HALO=4) 应来自 gf[1] 的首行=20.0 */
+  CHK(gfs[0].u_curr[GFIDX(&gfs[0], dc->group_tiles[0].ny + halo, halo)] == 20.0,
+      "gf[0] up-halo(row ny+1) should be 20.0 from gf[1] first row");
+
+  /* gf[1]: 下方halo(row 0) 应来自 gf[0] 的末行=11.0 */
+  CHK(gfs[1].u_curr[GFIDX(&gfs[1], 0, halo)] == 11.0,
+      "gf[1] down-halo(row 0) should be 11.0 from gf[0] last row");
+  /* gf[1]: 上方halo(row ny+HALO=4) 应来自 gf[2] 的首行=30.0 */
+  CHK(gfs[1].u_curr[GFIDX(&gfs[1], dc->group_tiles[1].ny + halo, halo)] == 30.0,
+      "gf[1] up-halo(row ny+1) should be 30.0 from gf[2] first row");
+
+  /* gf[2]: 下方halo(row 0) 应来自 gf[1] 的末行=21.0 */
+  CHK(gfs[2].u_curr[GFIDX(&gfs[2], 0, halo)] == 21.0,
+      "gf[2] down-halo(row 0) should be 21.0 from gf[1] last row");
+
+  for (int g = 0; g < dc->n_groups; g++) group_free_field(&gfs[g]);
+  free(gfs);
+  mythread_decomp_free(dc);
+  PASS();
+}
+
+/* ── TC-F10: intra halo XY_2D 四方向验证 ── */
+static void test_halo_intra_xy2d(void) {
+  TEST("halo-intra-xy2d");
+  /* 4 组 2x2，每组 3x3 内部，halo=1 → 含 halo: 5x5 */
+  mythread_decomp *dc = mythread_decomp_create(6, 6, 1, 4, 0,
+      MYTHREAD_DECOMP_XY_2D);
+  GroupField *gfs = calloc((size_t)dc->n_groups, sizeof(GroupField));
+  for (int g = 0; g < dc->n_groups; g++)
+    CHK(group_alloc_field(&gfs[g], g, dc) == 0, "alloc failed");
+  group_field_link_buffers(gfs, dc);
+
+  /* 每组填不同值 */
+  for (int g = 0; g < dc->n_groups; g++)
+    group_field_fill(&gfs[g], (double)(g + 10));
+
+  mythread_halo_exchange_intra(gfs, dc);
+
+  int halo = dc->halo;
+  /* XY_2D 2x2: g0(左下), g1(右下), g2(左上), g3(右上)
+     Row 0=下方halo, Row ny+HALO=上方halo
+     g0: right=1, up=2, down=-1, left=-1
+       → 右halo(col nx+HALO=4)=11.0, 上halo(row ny+HALO=4)=12.0 */
+  CHK(gfs[0].u_curr[GFIDX(&gfs[0], halo + 1, dc->group_tiles[0].nx + halo)] == 11.0,
+      "XY_2D gf[0] right-halo should be 11.0 from gf[1]");
+  CHK(gfs[0].u_curr[GFIDX(&gfs[0], dc->group_tiles[0].ny + halo, halo)] == 12.0,
+      "XY_2D gf[0] up-halo(row ny+1) should be 12.0 from gf[2]");
+
+  /* g3(右上): left=2, down=1, up=-1, right=-1
+       → 左halo(col 0)=12.0, 下halo(row 0)=11.0 */
+  CHK(gfs[3].u_curr[GFIDX(&gfs[3], halo, 0)] == 12.0,
+      "XY_2D gf[3] left-halo should be 12.0 from gf[2]");
+  CHK(gfs[3].u_curr[GFIDX(&gfs[3], 0, halo)] == 11.0,
+      "XY_2D gf[3] down-halo(row 0) should be 11.0 from gf[1]");
+
+  for (int g = 0; g < dc->n_groups; g++) group_free_field(&gfs[g]);
+  free(gfs);
+  mythread_decomp_free(dc);
+  PASS();
+}
+
+int main(void) {
+  printf("\n=== mythread GroupField + Halo tests ===\n\n");
+
+  test_alloc_free_y_only();
+  test_alloc_free_xy2d();
+  test_gfidx();
+  test_fill_swap();
+  test_numa_info();
+  test_repeated_alloc_free();
+  test_boundary_mpi_buffers();
+  test_single_group();
+  test_halo_intra_correctness();
+  test_halo_intra_xy2d();
+
+  printf("\n=== Results: %d run, %d passed, %d failed ===\n",
+         tests_run, tests_passed, tests_failed);
+  return tests_failed > 0 ? 1 : 0;
+}
