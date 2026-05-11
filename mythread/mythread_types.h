@@ -93,6 +93,7 @@ typedef struct _mt_taskpool mt_taskpool;
 __BEGIN_DECLS
 extern threadProc md;
 extern int mpi_id, NCorePClu,NCluPNode, NCorePGrp,NGrpPProc,NThPGrp,NProcPNode,ManageCoreId,NThreads;
+extern int CoreOffset, ClustOffset;
 extern __thread THREADINFO *ti;
 extern __thread threadGroup *gi;
 extern int ThreadG;

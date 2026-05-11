@@ -23,6 +23,7 @@ __thread void*gd=NULL;
 /* ── global config ── */
 int ThreadG=-1;
 int mpi_id,NCorePClu=38,NCluPNode=16,NCorePGrp=38,NGrpPProc=4,NThPGrp=7,NProcPNode=16,ManageCoreId=-1,NThreads=3;
+int CoreOffset=0, ClustOffset=0;
 int sync_flag_init = 6666;
 threadProc md={0};
 
@@ -177,7 +178,7 @@ void initmd(void){
     cbase=0;
     if(NProcPNode<1)NProcPNode=1;
     int ipr=mpi_id%NProcPNode;
-    cbase=ipr*NCorePClu*NGrpPProc;
+    cbase=ipr*NCorePClu*NGrpPProc + ClustOffset*NCorePClu;
     if(ManageCoreId <-2)ManageCoreId =0;
     else if(ManageCoreId >0&&ManageCoreId<NThPGrp)ManageCoreId =0;
     else if(ManageCoreId>NCorePClu){
@@ -186,10 +187,10 @@ void initmd(void){
       }
     }
     if(ManageCoreId ==0){
-      ManageCoreId = cbase;
+      ManageCoreId = cbase + CoreOffset;
       mg=0;mt=0;
     }else if(ManageCoreId ==-1){
-      ManageCoreId = cbase;
+      ManageCoreId = cbase + CoreOffset;
       mg=0;mt=0;
     }else if(ManageCoreId ==-2){
       mg=-1;
@@ -198,7 +199,7 @@ void initmd(void){
     }else{
       if(ManageCoreId<NCorePClu){
         mg=0;mt=ManageCoreId;
-        ManageCoreId+=cbase;
+        ManageCoreId+=cbase+CoreOffset;
       }else{
         mg=-1;mt=-1;
         ManageCoreId = (ipr+NCorePClu*NCluPNode);
@@ -232,7 +233,7 @@ void initmd(void){
         pti->Nthreads=pgi->Nthreads;
         pti->MainThread=(j==0);
         pti->igrp=pgi->igrp;
-        pti->indg=cbase+pti->igrp*NCorePClu +j+ib;
+        pti->indg=cbase+pti->igrp*NCorePClu +j+ib+CoreOffset;
         pti->sib=pti->ind+1;
         pti->state = 0;
         if(pti->ind%NGG){
@@ -251,7 +252,7 @@ void initmd(void){
     md.idMainThread=1;
     int ipr=mpi_id%NProcPNode;
     if(NProcPNode<=NCluPNode){
-      cbase=ipr*NCorePClu;
+      cbase=ipr*NCorePClu + ClustOffset*NCorePClu;
     }else{
       int n=NCorePClu/NThPGrp;
       if(n>1){
@@ -270,7 +271,7 @@ void initmd(void){
       }
       pti->ind=j;
       pti->sync_flag = sync_flag_init;
-      pti->indg=cbase+j+1;
+      pti->indg=cbase+j+1+CoreOffset;
       pti->state = 0;
       pti->Nthreads=NThPGrp;
       pti->MainThread=(j==0);

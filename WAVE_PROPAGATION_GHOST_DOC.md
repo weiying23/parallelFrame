@@ -1,333 +1,362 @@
-# 重新设计的二维波动方程示例说明
+# 二维波动方程并行示例说明
 
 ## 1. 总览
 
-`wave_propagation_ghost.c` 是一个 `MPI + mythread` 的二维波动方程示例，用来计算：
+本目录包含两个基于 `MPI + mythread` 的二维波动方程求解器，计算：
 
-```text
-u_tt = c^2 (u_xx + u_yy)
+```
+u_tt = C0² (u_xx + u_yy)
 ```
 
-当前版本的目标有三点：
+| 文件 | 调度方式 | 说明 |
+|------|----------|------|
+| `wave_propagation_ghost.c` | **任务池动态调度** | Worker 通过 `mt_taskpool` 竞争 2D chunk；适合 UMA / 负载不均场景 |
+| `wave_propagation_ghost_fix.c` | **固定静态划分** | Worker 持有固定矩形 tile；适合多 NUMA / 核心数均匀场景 |
 
-1. 保持数值逻辑清晰，边界与能量诊断自洽。
-2. 尽量把计算下放到从线程，减轻 `main_thread()` 和 `group_main_thread()` 的负担。
-3. 减少多组线程下的远程内存访问，把大块数组尽量 first-touch 到对应线程组附近的本地内存。
+两个实现共享同一底层架构（三级 mythread 模块、配置文件、诊断输出）。
 
-## 2. 并行结构
+---
 
-整体分解是三层：
+## 2. 架构分层
 
-1. `MPI` 采用二维进程网格 `(Px, Py)`，同时切分全局 `X` 与 `Y` 区间（每个 rank 持有一个矩形子域）。
-2. 每个 MPI rank 内部，线程组再次把本地子域切分为二维网格 `(Gx, Gy)`（每个组持有一个矩形 tile）。
-3. 每个组内部，worker 线程继续把该组 tile 划分为二维网格 `(Tx, Ty)`，每个 worker 持有一个矩形子 tile。
-
-可以把它看成：
-
-```text
-全局网格
-  -> MPI rank 拥有一个 (X,Y) 矩形子域
-     -> 每个线程组拥有该 rank 的一个 (X,Y) 矩形 tile
-        -> 每个 worker 线程拥有该 tile 中的一个更小的 (X,Y) 矩形子 tile
+```
+┌─────────────────────────────────────────┐
+│  应用层 (wave_propagation_ghost*.c)      │
+├─────────────────────────────────────────┤
+│  Layer 3: Halo 交换 (mythread_halo)      │
+│  · mythread_halo_exchange_intra (组间)   │
+│  · mythread_halo_exchange_mpi  (MPI)     │
+├─────────────────────────────────────────┤
+│  Layer 2: NUMA 感知分配 (mythread_field) │
+│  · GroupField (每组独立波场平面)          │
+│  · group_alloc_field / GFIDX / swap      │
+├─────────────────────────────────────────┤
+│  Layer 1: 域分解 (mythread_decomp)       │
+│  · Y_ONLY / XY_2D 两种策略               │
+│  · group_tiles / worker_tiles / 邻居拓扑  │
+├─────────────────────────────────────────┤
+│  mythread 核心 (sync / pool / thread)    │
+└─────────────────────────────────────────┘
 ```
 
-需要注意的是，`mythread` 中 `NGrpPProc <= 1` 并不表示“只有 1 个组”，而是直接退回非分组模式。因此当前示例同时兼容两种执行方式：
+### 2.1 NUMA 感知内存
 
-- `ThreadG != 0`：分组模式，使用 `mSetGrps / gWaitMain / sWaitGrp` 这套接口。
-- `ThreadG == 0`：非分组模式，退回 `mSetSubs / sWaitState` 这套接口。
+每个线程组拥有一份独立的 `GroupField`，包含 3 个波场平面和 halo 缓冲。物理内存在 GMT 线程中分配（`bindcpu` 已生效），通过 `numa_alloc_onnode` 绑定到该组所在 NUMA 节点。无 libnuma 时退化为 `malloc` + first-touch。
 
-兼容入口在 [`wave_propagation_ghost.c:221`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L221)。
+### 2.2 组间 halo 交换
 
-## 3. 主要数据结构
+MMT 在每步计算前集中执行：
+1. `apply_dirichlet_all_groups()` — 物理边界归零
+2. `mythread_halo_exchange_intra()` — 组间 memcpy
+3. `mythread_halo_exchange_mpi()` — 边界组 MPI 收发
+4. `apply_dirichlet_all_groups()` — 再次归零
 
-### 3.1 `SimulationData`
+仅域边界组参与 MPI 通信，内部组完全通过本地 memcpy 完成。
 
-进程级共享状态：
+---
+
+## 3. 并行分解
+
+### 3.1 三层分解
+
+```
+全局网格 (NX × NY)
+  → MPI rank (Px × Py 二维进程网格)
+    → 线程组 (Gx × Gy，Y_ONLY 或 XY_2D)
+      → Worker 线程 (静态 tile 或 动态 2D chunk)
+```
+
+### 3.2 组间分解策略
+
+| 策略 | 宏值 | 说明 |
+|------|------|------|
+| `Y_ONLY` | 0 | 仅 Y 方向切分组，每组覆盖进程全部 X 范围；组间邻居最多 2 个 |
+| `XY_2D` | 1 | X+Y 都切分，组排为 2D 网格；组间邻居最多 4 个；MPI 通信仅由边界组承担 |
+
+配置方式：`config/hardware.cfg` 中 `GROUP_DECOMP = 0` 或 `1`。
+
+### 3.3 两种调度方式
+
+#### 任务池 (`wave_propagation_ghost.c`)
+
+- GMT 将本组子域按 `CHUNK_ROWS × CHUNK_COLS`（默认 16×256）切分为 2D chunk
+- 所有 chunk 作为 `RowTaskCtx` 提交到 `mt_taskpool`
+- 组内 worker 动态竞争取任务，快核多抢，慢核少做
+- 天然负载均衡，适合 P/E 混合架构
+
+#### 固定划分 (`wave_propagation_ghost_fix.c`)
+
+- 每个 worker 在组内持有固定矩形 tile `[x_begin,x_end) × [y_begin,y_end)`
+- 通过 `mythread_decomp_worker_tile` 均匀划分
+- 零任务池开销（无 mutex 竞争）
+- 配合 NUMA 分配在多 NUMA 机器上效果最优
+
+---
+
+## 4. 主要数据结构
+
+### 4.1 `GroupField` (mythread_field.h)
+
+```c
+typedef struct GroupField {
+  double *u_prev, *u_curr, *u_next;  // 三个波场平面
+  int ny_padded, nx_padded, stride;  // 含 halo 的尺寸
+  size_t plane_bytes;                // 单平面字节数
+  double *send_to_up/down/left/right;  // 组间 halo 缓冲
+  double *send_up/down/left/right;     // MPI halo 缓冲
+  int numa_node;                     // NUMA 节点 ID
+  double group_energy;               // 本组能量累加器
+} GroupField;
+```
+
+### 4.2 `RowTaskCtx` (仅任务池版)
 
 ```c
 typedef struct {
-  double *u_prev;
-  double *u_curr;
-  double *u_next;
-  int local_x_begin;
-  int local_x_end;
-  int local_nx;
-  int local_y_begin;
-  int local_y_end;
-  int local_ny;
-  int mpi_rank;
-  int mpi_size;
-  int proc_x;
-  int proc_y;
-  int proc_px;
-  int proc_py;
-  int neighbor_left;
-  int neighbor_right;
-  int neighbor_up;
-  int neighbor_down;
+  int y_begin, y_end, x_begin, x_end;  // chunk 在 GroupField 内的坐标
+  int gid;                              // 所属组 ID
+  GroupField *gf;                       // 所属 GroupField
+  double *energy_acc, *l2_acc;         // 原子累加器指针
+  double *max_amp;                      // 最大振幅 CAS 指针
+  int *max_amp_gx, *max_amp_gy;        // 振幅位置
+} RowTaskCtx;
+```
+
+### 4.3 `SimulationData`
+
+进程级 MPI 拓扑信息（两个版本共用）：
+
+```c
+typedef struct {
+  int local_x_begin, local_x_end, local_nx;
+  int local_y_begin, local_y_end, local_ny;
+  int mpi_rank, mpi_size;
+  int proc_x, proc_y, proc_px, proc_py;
+  int neighbor_left, neighbor_right, neighbor_up, neighbor_down;
   double initial_energy;
 } SimulationData;
 ```
 
-含义：
+波场平面不再存放在这里，已迁移到 `GroupField` 中。
 
-- `u_prev / u_curr / u_next`：当前 MPI 进程共享的三个时间层。
-- `local_x_begin / local_x_end`：本 rank 负责的全局 `X` 区间。
-- `local_y_begin / local_y_end`：本 rank 负责的全局 `Y` 区间。
-- `local_nx / local_ny`：本地真实物理列/行数。
-- `proc_(x,y) / proc_(px,py)`：MPI 二维进程网格与本 rank 的网格坐标。
-- `neighbor_left/right/up/down`：四个方向相邻 MPI rank（用于 halo 交换）。
+---
 
-局部数组四周都有 halo，因此实际分配尺寸是 `(local_ny + 2*HALO) x (local_nx + 2*HALO)`。
+## 5. 线程职责
 
-### 3.2 `ThreadTask`
+### 5.1 主管理线程 MMT (`main_thread`)
 
-线程级任务描述：
+- 发起阶段同步 (`mSetGrps` / `mSetSubs`)
+- 组间 + MPI halo 交换
+- 每组独立 `group_field_swap`
+- MPI 全局能量/L² 归约
+- 诊断输出
 
-```c
-typedef struct {
-  int gid;
-  int tid;
-  int x_begin;
-  int x_end;
-  int y_begin;
-  int y_end;
-  double partial_energy;
-} ThreadTask;
-```
+### 5.2 组主线程 GMT (`group_main_thread`)
 
-含义：
+- **分配本组 GroupField**（此时 bindcpu 已生效，NUMA 节点正确）
+- 任务池版：管理 `mt_taskpool` 生命周期（attach/begin/submit/close/wait/shutdown）
+- 固定划分版：`gSetSubs` → `gWaitSubs` 同步 worker
+- 组内能量/L² 归约 (`reduce_group_worker_energy`)
 
-- `gid / tid`：所属组和组内线程号。
-- `x_begin / x_end`：该线程负责的 `X` 区间。
-- `y_begin / y_end`：该线程负责的本地 `Y` 区间。
-- `partial_energy`：该线程负责 tile 的局部离散总能量。
+### 5.3 Worker 线程 (`worker_thread`)
 
-## 4. 线程职责
+- 任务池版：`mt_taskpool_worker_loop` 循环取任务执行
+- 固定划分版：等待 GMT 同步信号，在自己的固定 tile 上计算
+- 四种回调：`task_init_field` / `task_compute_interior` / `task_compute_boundary` / `task_compute_energy`
 
-### 4.1 主线程 `main_thread()`
+---
 
-主线程现在只负责：
-
-1. 发起阶段同步。
-2. 做 halo 通信。
-3. 执行 `swap_fields()`。
-4. 在需要时做 MPI 全局能量归约。
-
-它不再负责大块差分更新，也不再扫描整个局部网格计算能量。
-
-### 4.2 组主线程 `group_main_thread()`
-
-组主线程现在只负责：
-
-1. 等待主线程发来的阶段状态。
-2. 唤醒本组从线程。
-3. 等待本组从线程完成。
-4. 在能量阶段做组内小归约。
-
-它不再直接调用差分更新核。
-
-### 4.3 从线程 `worker_thread()`
-
-从线程负责全部主要数值工作：
-
-1. 并行初始化本线程负责 tile 上的 `u_prev / u_curr / u_next`。
-2. 计算内部行更新。
-3. 计算边界行更新。
-4. 在需要输出诊断时，计算本线程 tile 上的离散总能量。
-
-## 5. 当前版本做过的关键优化
-
-### 5.1 能量诊断按需触发
-
-能量诊断不再每步都做，而是只在：
-
-- 初始时刻
-- 每 `ENERGY_REPORT_INTERVAL` 步
-- 最后一步
-
-默认参数在代码里是：
-
-```c
-#define ENERGY_REPORT_INTERVAL 60
-```
-
-这样可以显著减少每步都触发的能量阶段和 `MPI_Allreduce` 次数。
-
-### 5.2 halo 通信与内部计算重叠
-
-只有紧贴 MPI 边界的首末物理行依赖远端 halo，因此每步更新拆成两部分：
-
-1. 内部行阶段：不依赖新的 MPI halo。
-2. 边界行阶段：依赖新的 MPI halo。
-
-主线程在 halo 通信进行时，先让从线程计算内部行；通信完成后，再补算边界行。这样可以把一部分 MPI 等待隐藏到从线程计算里。
-
-非阻塞 halo 通信入口在 [`wave_propagation_ghost.c:486`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L486)。
-
-### 5.3 通过并行 first-touch 缓解远程内存访问
-
-这是当前针对多组线程性能问题新增的重点优化。
-
-之前 `u_prev / u_curr` 的初始写入主要由主线程完成，容易导致：
-
-- 页面 first-touch 落在主线程所在 cluster / NUMA 节点
-- 其他线程组后续计算时大量读取远程内存
-- 多组模式下不同 worker 的 `compute_interior_block()` 时间差显著放大
-
-现在改成：
-
-1. 先完成线程任务划分。
-2. 主线程发起专门的“初始化阶段”。
-3. 每个从线程在自己的 tile 上并行写入 `u_prev / u_curr / u_next`。
-
-这样 bulk 页面会优先由负责该 tile 的 worker 触页，更容易落到该组本地内存。初始化核在 [`wave_propagation_ghost.c:367`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L367)。
-
-## 6. 时间推进顺序
+## 6. 时间推进流程
 
 ### 6.1 初始化阶段
 
-进入时间循环前，顺序如下：
+1. MMT 发起 `init_fields_state` 同步
+2. GMT 分配 GroupField → Worker 并行初始化波场
+3. MMT: `group_field_link_buffers` + Dirichlet + halo 交换 + `copy_curr_to_prev`
+4. MMT 发起 `initial_energy_state` → Worker 计算能量/L²/振幅 → 归约输出
 
-1. 主线程发起 `init_fields_state()`。
-2. 所有 worker 并行初始化各自 tile 上的 `u_prev / u_curr / u_next`。
-3. 主线程对 `u_curr` 和 `u_prev` 做初始 halo 交换。
-4. 主线程发起初始能量阶段。
-5. worker 计算局部能量，组主线程做组内归约，主线程做 MPI 全局归约。
+### 6.2 每步循环
 
-### 6.2 每一步的执行顺序
-
-对第 `step` 步：
-
-1. 如有需要，主线程先发起新的 `u_curr` halo 通信。
-2. 主线程发起内部行阶段。
-3. worker 计算不依赖远端 halo 的内部行。
-4. 主线程等待 halo 通信完成。
-5. 主线程发起边界行阶段。
-6. worker 计算依赖 halo 的边界行。
-7. 主线程执行 `swap_fields()`。
-8. 如果当前步需要输出能量：
-   主线程先补齐新的 `u_curr` halo，再发起能量阶段。
-9. worker 计算局部能量，组主线程做组内归约，主线程做 MPI 全局归约。
-
-## 7. 同步状态
-
-当前使用的状态值是：
-
-```c
-init_fields_state() = 1
-initial_energy_state() = 2
-compute_phase_state(step) = 3 * step + 3
-boundary_phase_state(step) = 3 * step + 4
-energy_phase_state(step) = 3 * step + 5
+```
+for step in 0..NT-1:
+  1. MMT: apply_dirichlet + halo_exchange(intra + mpi)
+  2. MMT: start_phase(compute) → workers compute_interior → wait_phase
+  3. MMT: start_phase(boundary) → workers compute_boundary → wait_phase
+  4. MMT: group_field_swap (每组独立)
+  5. if need_energy:
+       MMT: apply_dirichlet + halo_exchange
+       MMT: start_phase(energy) → workers compute_energy → reduce → MPI_Allreduce
 ```
 
-含义：
+### 6.3 同步状态编码
 
-- `1`：并行初始化阶段
-- `2`：初始能量阶段
-- `3*step+3`：内部行阶段
-- `3*step+4`：边界行阶段
-- `3*step+5`：能量阶段
-
-这些入口分别在：
-
-- [`wave_propagation_ghost.c:225`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L225)
-- [`wave_propagation_ghost.c:194`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L194)
-- [`wave_propagation_ghost.c:198`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L198)
-- [`wave_propagation_ghost.c:202`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L202)
-- [`wave_propagation_ghost.c:206`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L206)
-
-## 8. 数值更新与能量
-
-更新核仍然使用二维显式二阶差分：
-
-```text
-u_next(y, x) =
-  2*u_curr(y, x) - u_prev(y, x)
-  + c^2 * dt^2 * (
-      (u_curr(y, x-1) - 2*u_curr(y, x) + u_curr(y, x+1)) / dx^2
-    + (u_curr(y-1, x) - 2*u_curr(y, x) + u_curr(y+1, x)) / dy^2
-    )
+```
+init_fields_state     = 1
+initial_energy_state  = 2
+compute_phase(s)      = 3s + 3
+boundary_phase(s)     = 3s + 4
+energy_phase(s)       = 3s + 5
 ```
 
-边界规则：
+---
 
-- 左右边界固定为 0。
-- 全局最上、最下物理边界固定为 0。
-- MPI 之间交换 `X` 与 `Y` 两个方向的 halo。
+## 7. 诊断指标
 
-离散总能量按 tile 分配给 worker，再做组内和全局归约。能量核在 [`wave_propagation_ghost.c:663`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L663)。
+每步能量诊断输出包含：
 
-## 9. 分辨率与稳定性
+| 指标 | 含义 | 守恒性 |
+|------|------|--------|
+| `E` | 总能量 ½∫(u_t² + C0²\|∇u\|²) | Dirichlet 边界下衰减 |
+| `L2` | L² 范数 √(∫u² dA) | 随波扩散递增 |
+| `max\|u\|` | 最大振幅 | 不守恒，检测 blow-up |
+| `@(gx,gy)` | 振幅峰值全局坐标 | 追踪波前位置 |
 
-代码提供两种分辨率模式：
-
-```c
-#define USE_FIXED_DOMAIN 0
+示例输出：
+```
+[Main] Initial: E=1.570796 L2=148.875 max|u|=9.999996@(6999,6999)
+[Main] Step   60/480, time 6.493,  E=1.570796 L2=257.860 max|u|=9.999996@(6999,6999)
 ```
 
-- `USE_FIXED_DOMAIN=1`：固定物理区域，增大 `NX / NY` 表示网格加密。
-- `USE_FIXED_DOMAIN=0`：固定 `DX / DY`，增大 `NX / NY` 表示物理区域扩大。
+---
 
-显式格式需要满足 CFL 条件：
+## 8. 配置文件
 
-```text
-(c*dt/dx)^2 + (c*dt/dy)^2 <= 1
+参数通过两个配置文件读入（编译默认值 → 配置文件 → 环境变量，优先级递增）：
+
+### `config/case.cfg` — 算例参数
+
+```ini
+NX = 14000
+NY = 14000
+NT = 480
+A = 10.0
+DT = 0.01
+C0 = 0.1
+USE_FIXED_DOMAIN = 0
+HALO = 1
+ENERGY_REPORT_INTERVAL = 60
 ```
 
-程序启动时会检查：
+### `config/hardware.cfg` — 硬件/线程参数
 
-- `CFL_X = C0 * DT / DX`
-- `CFL_Y = C0 * DT / DY`
-- `CFL_SUM2 = CFL_X^2 + CFL_Y^2`
+```ini
+N_GROUPS = 2
+N_WORKERS = 3
+GROUP_DECOMP = 0
+NCorePClu = 5
+NCluPNode = 2
+NCorePGrp = 4
+ManageCoreId = 4
+```
 
-## 10. 关键代码位置
-
-关键位置都在 [`wave_propagation_ghost.c`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c)：
-
-- 并行初始化 first-touch：[`wave_propagation_ghost.c:367`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L367)
-- 进程域初始化与内存分配：[`wave_propagation_ghost.c:336`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L336)
-- 非阻塞 halo 交换：[`wave_propagation_ghost.c:486`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L486)
-- 内部行更新：[`wave_propagation_ghost.c:594`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L594)
-- 边界行更新：[`wave_propagation_ghost.c:619`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L619)
-- 局部能量计算：[`wave_propagation_ghost.c:663`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L663)
-- 任务划分：[`wave_propagation_ghost.c:745`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L745)
-- worker 入口：[`wave_propagation_ghost.c:879`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L879)
-- 组主线程入口：[`wave_propagation_ghost.c:934`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L934)
-- 主线程入口：[`wave_propagation_ghost.c:999`](/C:/Users/write/Documents/projects/parallelFrame/parallelFrame/wave_propagation_ghost.c#L999)
-
-## 11. 编译与运行
-
-### 11.1 编译
+### 环境变量覆盖
 
 ```bash
-mpicc -Wall -O2 -o wave_propagation_ghost \
-    wave_propagation_ghost.c \
-    mythread/mythread.c \
-    -lpthread -lm
+# 自定义配置路径
+WAVE_CASE_CFG=my_case.cfg WAVE_HARDWARE_CFG=my_hw.cfg mpirun ...
+
+# 负载不均衡测试
+WAVE_IMBALANCE_PCT=50 mpirun -np 1 ./wave_propagation_ghost
+WAVE_IMBALANCE_WORKER=0 WAVE_IMBALANCE_PCT=30 mpirun ...
 ```
 
-如需做小规模快速验证或调参，可以在编译时用 `-D` 覆盖默认宏，例如：
+---
+
+## 9. 编译与运行
+
+### 9.1 编译
 
 ```bash
-mpicc -Wall -O2 -DNX=256 -DNY=128 -DNT=10 -DN_GROUPS=4 -DN_WORKERS=8 \
-    -o wave_propagation_ghost_small wave_propagation_ghost.c mythread/mythread.c -lpthread -lm
+make all
 ```
 
-### 11.2 运行
+生成目标：`wave_propagation_ghost`（任务池版）、`wave_propagation_ghost_fix`（固定划分版）。
+
+编译依赖 `mpicc`、`libpthread`、`libm`。可选 `libnuma`（Linux 上 NUMA 感知分配）。
+
+### 9.2 运行
 
 ```bash
+# 默认参数（从 config/ 读取）
 mpirun -np 4 ./wave_propagation_ghost
+mpirun -np 4 ./wave_propagation_ghost_fix
+
+# 不均衡负载测试
+WAVE_IMBALANCE_PCT=50 mpirun -np 1 ./wave_propagation_ghost
 ```
 
-## 12. 本次针对远程内存访问的修改摘要
+### 9.3 性能测试
 
-这次新增的直接修改点有：
+```bash
+# 快速对比（48 测试，~2 分钟）
+./scripts/benchmark.sh quick
 
-- 去掉主线程里的 bulk 初值写入，改成 worker 并行初始化。
-- 新增 `init_fields_state()` 阶段，用来统一调度并行 first-touch。
-- 把 `u_prev / u_curr / u_next` 的 bulk 页面尽量 first-touch 到对应 worker 所在组附近。
-- 线程组和 worker 的任务划分现在都基于二维 tile：组层先二维切分本地 `(X,Y)` 子域，组内 worker 再二维切分该组 tile。
-- 保留 `N_GROUPS=1` 时的兼容逻辑，单组退回非分组模式时仍然能走同样的并行初始化。
-- 把 worker 内部的调试计时改成真正只包 `compute_interior_block()`，并在 `DEBUG` 下才输出，避免打印本身继续污染性能测量。
+# 完整矩阵
+./scripts/benchmark.sh full
+```
+
+日志保存至 `logs/YYYYMMDD_HHMMSS/`，汇总 CSV 自动生成。
+
+---
+
+## 10. 数值方法
+
+### 10.1 离散格式
+
+```
+u_next(y,x) = 2*u_curr(y,x) - u_prev(y,x)
+  + C0²·dt²·[(u_curr(y,x-1)-2·u_curr(y,x)+u_curr(y,x+1))/dx²
+            + (u_curr(y-1,x)-2·u_curr(y,x)+u_curr(y+1,x))/dy²]
+```
+
+### 10.2 边界条件
+
+- 全局 X=0、X=NX-1、Y=0、Y=NY-1：Dirichlet 固定为 0
+- MPI 进程间：halo 行/列交换
+- 组间：本地 memcpy 交换边界行/列
+
+### 10.3 稳定性
+
+显式格式需满足 CFL 条件：`(C0·dt/dx)² + (C0·dt/dy)² ≤ 1`。程序启动时自动检查。
+
+---
+
+## 11. mythread 模块清单
+
+| 模块 | 文件 | 功能 |
+|------|------|------|
+| 域分解 | `mythread_decomp.h/.c` | Y_ONLY/XY_2D 策略，tile 分配，邻居拓扑 |
+| 字段分配 | `mythread_field.h/.c` | GroupField，NUMA 感知分配，GFIDX/swap |
+| Halo 交换 | `mythread_halo.h/.c` | 组内 memcpy 交换 + MPI 边界交换 |
+| 配置解析 | `mythread_config.h/.c` | INI 格式配置文件解析 |
+| 同步原语 | `mythread_sync.h/.c` | 三级屏障 (SM/MS, SG/GS, GM/MG) |
+| 任务池 | `mythread_pool.h/.c` | SPMC 任务队列 (epoch-driven) |
+| 线程管理 | `mythread_thread.h/.c` | 线程创建/生命周期/CPU 绑定 |
+| 计时器 | `mythread_timer.h/.c` | TSC 性能计时 |
+| LocV 存储 | `mythread_locv.h/.c` | 线程/组/进程三级指针存储 |
+| Fortran 接口 | `mythread_fortran.h/.c` | trailing-underscore 包装 |
+| CPU 绑定测试 | `test_bindcpu.c` | 9 个测试用例 |
+| 域分解测试 | `test_field.c` | 10 个 GroupField + Halo 测试 |
+
+---
+
+## 12. 性能调优参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `CHUNK_ROWS` | 16 | 任务池版 Y 方向 chunk 行数 |
+| `CHUNK_COLS` | 256 | 任务池版 X 方向 chunk 列数；设极大值退化为 Y-only |
+| `TP_CAP` | 512 | 任务池容量；BLOCK 模式下 PMT 阻塞等待 |
+| `N_GROUPS` | 2 | 线程组数；≤1 自动切换非分组模式 |
+| `N_WORKERS` | 3 | 每组 worker 数（不含 GMT） |
+| `GROUP_DECOMP` | 0 | 0=Y_ONLY, 1=XY_2D |
+
+---
+
+## 13. 已知限制
+
+- `choose_2d_grid` 中 `span_x/y` 为 `int`，超大网格（>2³¹ 点）可能溢出
+- macOS 不支持 `sched_setaffinity`，CPU 绑定退化为空操作
+- 无 libnuma 时 NUMA 感知退化为 malloc + first-touch（仍有效但无显式节点绑定）
+- 任务池版 `g_n_flat_tasks` 仍为 `int`（非组模式），极端大网格下需改为 `size_t`
+- `apply_imbalance_to_group` 仅修改 Y 方向，X 方向始终保持均匀

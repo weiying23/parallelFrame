@@ -28,6 +28,7 @@ static double cfg_DX, cfg_DY, cfg_LX, cfg_LY, cfg_DT2, cfg_CFL_X, cfg_CFL_Y, cfg
 static int    cfg_HALO=1, cfg_N_GROUPS=2, cfg_N_WORKERS=3, cfg_THREADS_PER_GROUP=4;
 static int    cfg_ENERGY_REPORT_INTERVAL=60, cfg_GROUP_DECOMP=0;
 static int    cfg_NCorePClu=5, cfg_NCluPNode=2, cfg_NCorePGrp=4, cfg_ManageCoreId=4;
+static int    cfg_CoreOffset=0, cfg_ClustOffset=0;
 
 static void cfg_compute_derived(void) {
   if (cfg_USE_FIXED_DOMAIN) {
@@ -1195,6 +1196,8 @@ int main(int argc, char **argv) {
   NThPGrp    = cfg_THREADS_PER_GROUP;
   NGrpPProc  = cfg_N_GROUPS;
   ManageCoreId = cfg_ManageCoreId;
+  CoreOffset  = cfg_CoreOffset;
+  ClustOffset = cfg_ClustOffset;
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
 

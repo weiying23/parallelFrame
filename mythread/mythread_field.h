@@ -54,6 +54,7 @@ typedef struct GroupField {
 
   /* ── NUMA 信息 ── */
   int numa_node;
+  int numa_ok;                 /* 1=NUMA 分配成功, 0=已回退 malloc */
 
   /* ── 能量 ── */
   double group_energy;
