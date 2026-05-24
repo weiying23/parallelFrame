@@ -725,7 +725,7 @@ static void ungrouped_main(void) {
       task->t_allreduce+=wall_time()-t0; task->energy_steps+=1;
       if (mpi_id==0) {
         double ct=MPI_Wtime()-prev_time; prev_time=MPI_Wtime();
-        printf("[Main] Step %4d/%d, time %.3f,  E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\\n",step+1,NT,ct,global_e,accumulate_l2(),g_max_amp,g_max_amp_gx,g_max_amp_gy);
+        printf("[Main] Step %4d/%d, time %.3f,  E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",step+1,NT,ct,global_e,accumulate_l2(),g_max_amp,g_max_amp_gx,g_max_amp_gy);
       }
     }
   }
@@ -791,7 +791,7 @@ static void main_thread(void) {
       task->t_allreduce+=wall_time()-t0_val; task->energy_steps+=1;
       if (mpi_id==0) {
         double ct=MPI_Wtime()-prev_time; prev_time=MPI_Wtime();
-        printf("[Main] Step %4d/%d, time %.3f,  E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\\n",step+1,NT,ct,global_e,l2,ma,max,may);
+        printf("[Main] Step %4d/%d, time %.3f,  E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",step+1,NT,ct,global_e,l2,ma,max,may);
       }
     }
   }

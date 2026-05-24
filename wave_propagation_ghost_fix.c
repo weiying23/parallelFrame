@@ -86,6 +86,8 @@ typedef struct {
   int y_begin, y_end;
   GroupField *gf;               /* 本组 GroupField 指针 */
   double partial_energy;
+  double partial_l2;
+  double partial_max; int partial_max_gx, partial_max_gy;
   double t_wait_init,   t_work_init;
   double t_wait_energy0, t_work_energy0;
   double t_wait_compute, t_work_compute;
@@ -124,6 +126,8 @@ static void reset_task_timers(ThreadTask *task) {
   if (!task) return;
   task->cpu_id = -1;
   task->partial_energy = 0.0;
+  task->partial_l2 = 0.0;
+  task->partial_max = 0.0; task->partial_max_gx = 0; task->partial_max_gy = 0;
   task->t_wait_init = task->t_work_init = 0.0;
   task->t_wait_energy0 = task->t_work_energy0 = 0.0;
   task->t_wait_compute = task->t_work_compute = 0.0;
@@ -559,16 +563,46 @@ static double reduce_group_worker_energy(int gid) {
   return e;
 }
 
-static double accumulate_l2(void) {
+static double reduce_group_worker_l2(int gid) {
   double s = 0.0;
-  if (uses_group_threads()) { for (int g=0; g<g_decomp->n_groups; g++) s+=g_group_l2[g]; }
-  return sqrt(s * DX * DY);
+  threadGroup *pg = md.grps[gid];
+  for (int t = 1; t < pg->Nthreads; t++) {
+    ThreadTask *task = (ThreadTask*)pg->threads[t].td;
+    s += task->partial_l2;
+  }
+  return s;
+}
+
+static void reduce_group_worker_max(int gid, double *max_out, int *gx, int *gy) {
+  double ma = 0.0; int mx = 0, my = 0;
+  threadGroup *pg = md.grps[gid];
+  for (int t = 1; t < pg->Nthreads; t++) {
+    ThreadTask *task = (ThreadTask*)pg->threads[t].td;
+    if (task->partial_max > ma) { ma = task->partial_max; mx = task->partial_max_gx; my = task->partial_max_gy; }
+  }
+  *max_out = ma; *gx = mx; *gy = my;
+}
+
+static double local_l2_sum(void) {
+  double s = 0.0;
+  if (uses_group_threads()) {
+    for (int g = 0; g < g_decomp->n_groups; g++) s += g_group_l2[g];
+  } else {
+    for (int t = 0; t < md.Nthreads - 1; t++)
+      s += ((ThreadTask*)md.threads[t].td)->partial_l2;
+  }
+  return s;
 }
 static void reduce_max_amp(double *amp, int *gx, int *gy) {
   *amp=0.0; *gx=*gy=0;
   if (uses_group_threads()) {
     for (int g=0; g<g_decomp->n_groups; g++)
       if (g_group_max[g] > *amp) { *amp=g_group_max[g]; *gx=g_group_max_x[g]; *gy=g_group_max_y[g]; }
+  } else {
+    for (int t = 0; t < md.Nthreads - 1; t++) {
+      ThreadTask *task = (ThreadTask*)md.threads[t].td;
+      if (task->partial_max > *amp) { *amp = task->partial_max; *gx = task->partial_max_gx; *gy = task->partial_max_gy; }
+    }
   }
 }
 static void reset_group_metrics(int gid) {
@@ -786,8 +820,8 @@ static void worker_thread(void) {
   task->partial_energy = compute_energy_block(gf, gid,
       task->y_begin, task->y_end, task->x_begin, task->x_end,
       &l2_, &ma_, &mx_, &my_);
-  g_group_l2[gid] += l2_;
-  if (ma_ > g_group_max[gid]) { g_group_max[gid]=ma_; g_group_max_x[gid]=mx_; g_group_max_y[gid]=my_; }
+  task->partial_l2 = l2_;
+  task->partial_max = ma_; task->partial_max_gx = mx_; task->partial_max_gy = my_;
   task->t_work_energy0 += wall_time() - t0;
   finish_phase_from_worker(initial_energy_state());
 
@@ -823,8 +857,8 @@ static void worker_thread(void) {
       task->partial_energy = compute_energy_block(gf, gid,
           task->y_begin, task->y_end, task->x_begin, task->x_end,
           &l2__, &ma__, &mx__, &my__);
-      g_group_l2[gid] += l2__;
-      if (ma__ > g_group_max[gid]) { g_group_max[gid]=ma__; g_group_max_x[gid]=mx__; g_group_max_y[gid]=my__; }
+      task->partial_l2 = l2__;
+      task->partial_max = ma__; task->partial_max_gx = mx__; task->partial_max_gy = my__;
       task->t_work_energy += wall_time() - t0;
       task->energy_steps += 1;
       finish_phase_from_worker(es);
@@ -865,6 +899,8 @@ static void group_main_thread(void) {
   task->t_wait_energy0 += wall_time() - t0;
   t0 = wall_time();
   g_gfields[gid].group_energy = reduce_group_worker_energy(gid);
+  g_group_l2[gid] = reduce_group_worker_l2(gid);
+  reduce_group_worker_max(gid, &g_group_max[gid], &g_group_max_x[gid], &g_group_max_y[gid]);
   task->t_work_energy0 += wall_time() - t0;
   gSetMain(initial_energy_state());
 
@@ -902,6 +938,8 @@ static void group_main_thread(void) {
       task->t_wait_energy += wall_time() - t0;
       t0 = wall_time();
       g_gfields[gid].group_energy = reduce_group_worker_energy(gid);
+      g_group_l2[gid] = reduce_group_worker_l2(gid);
+      reduce_group_worker_max(gid, &g_group_max[gid], &g_group_max_x[gid], &g_group_max_y[gid]);
       task->t_work_energy += wall_time() - t0;
       task->energy_steps += 1;
       gSetMain(es);
@@ -978,10 +1016,24 @@ static void main_thread(void) {
                 MPI_COMM_WORLD);
   task->t_allreduce += wall_time() - t0;
   g_sim.initial_energy = global_energy;
-  { double ma; int mx,my; reduce_max_amp(&ma,&mx,&my);
-  if (mpi_id == 0)
-    printf("[Main] Initial: E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",
-           g_sim.initial_energy, accumulate_l2(), ma, mx, my); }
+  { /* L2: MPI-reduce the sum-of-squares, then compute sqrt */
+    double local_l2 = local_l2_sum();
+    double global_l2_sum;
+    MPI_Allreduce(&local_l2, &global_l2_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    double global_l2 = sqrt(global_l2_sum * DX * DY);
+    /* max|u|: MPI-reduce position-aware */
+    double local_ma; int lmx, lmy; reduce_max_amp(&local_ma, &lmx, &lmy);
+    struct { double v; int r; } in = {local_ma, mpi_id}, out;
+    MPI_Allreduce(&in, &out, 1, MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+    int gx = lmx, gy = lmy;
+    if (out.r != mpi_id) {
+      MPI_Bcast(&gx, 1, MPI_INT, out.r, MPI_COMM_WORLD);
+      MPI_Bcast(&gy, 1, MPI_INT, out.r, MPI_COMM_WORLD);
+    }
+    if (mpi_id == 0)
+      printf("[Main] Initial: E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",
+             g_sim.initial_energy, global_l2, out.v, gx, gy);
+  }
 
   start_time = MPI_Wtime();
   double prev_time = start_time;
@@ -1045,9 +1097,22 @@ static void main_thread(void) {
         double cur_time = MPI_Wtime();
         double compute_time = cur_time - prev_time;
         prev_time = cur_time;
-        double ma; int mx, my; reduce_max_amp(&ma,&mx,&my);
+        /* L2: MPI-reduce */
+        double local_l2 = local_l2_sum();
+        double global_l2_sum;
+        MPI_Allreduce(&local_l2, &global_l2_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        double global_l2 = sqrt(global_l2_sum * DX * DY);
+        /* max|u|: MPI-reduce position-aware */
+        double local_ma; int lmx, lmy; reduce_max_amp(&local_ma, &lmx, &lmy);
+        struct { double v; int r; } in2 = {local_ma, mpi_id}, out2;
+        MPI_Allreduce(&in2, &out2, 1, MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+        int gx = lmx, gy = lmy;
+        if (out2.r != mpi_id) {
+          MPI_Bcast(&gx, 1, MPI_INT, out2.r, MPI_COMM_WORLD);
+          MPI_Bcast(&gy, 1, MPI_INT, out2.r, MPI_COMM_WORLD);
+        }
         printf("[Main] Step %4d/%d, time %.3f,  E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",
-               step + 1, NT, compute_time, global_energy, accumulate_l2(), ma, mx, my);
+               step + 1, NT, compute_time, global_energy, global_l2, out2.v, gx, gy);
       }
     }
   }
