@@ -259,18 +259,61 @@ static void copy_curr_to_prev_all(void) {
  *  计算核心：内联到 parallel-for 中消除函数调用开销
  * ═══════════════════════════════════════════════════════════════ */
 
+static void compute_region(GroupField *gf, int gid,
+                           int y_begin, int y_end, int x_begin, int x_end) {
+  for(int y=y_begin;y<y_end;y++){
+    int gy=global_y_from_local(gid,y);
+    if(gy==0||gy==NY-1)continue;
+    for(int x=x_begin;x<x_end;x++){
+      int gx=global_x_from_local(gid,x);
+      if(gx==0||gx==NX-1)continue;
+      double u_ij=gf->u_curr[GFIDX(gf,y,x)];
+      double d2x=(gf->u_curr[GFIDX(gf,y,x-1)]-2.0*u_ij+gf->u_curr[GFIDX(gf,y,x+1)])/(DX*DX);
+      double d2y=(gf->u_curr[GFIDX(gf,y-1,x)]-2.0*u_ij+gf->u_curr[GFIDX(gf,y+1,x)])/(DY*DY);
+      gf->u_next[GFIDX(gf,y,x)]=2.0*u_ij-gf->u_prev[GFIDX(gf,y,x)]+C0*C0*DT2*(d2x+d2y);
+    }
+  }
+}
+static void compute_interior(GroupField *gf, int gid,
+                             int y_begin, int y_end, int x_begin, int x_end) {
+  const mythread_tile *tile=&g_decomp->group_tiles[gid];
+  int ny=tile->ny,nx=tile->nx;
+  if(g_sim.neighbor_down>=0&&mythread_decomp_is_domain_boundary(g_decomp,gid,MYTHREAD_NEIGHBOR_DOWN)&&y_begin<HALO+1)y_begin=HALO+1;
+  if(g_sim.neighbor_up>=0&&mythread_decomp_is_domain_boundary(g_decomp,gid,MYTHREAD_NEIGHBOR_UP)&&y_end>ny)y_end=ny;
+  if(g_sim.neighbor_left>=0&&mythread_decomp_is_domain_boundary(g_decomp,gid,MYTHREAD_NEIGHBOR_LEFT)&&x_begin<HALO+1)x_begin=HALO+1;
+  if(g_sim.neighbor_right>=0&&mythread_decomp_is_domain_boundary(g_decomp,gid,MYTHREAD_NEIGHBOR_RIGHT)&&x_end>nx)x_end=nx;
+  if(y_begin<y_end&&x_begin<x_end)compute_region(gf,gid,y_begin,y_end,x_begin,x_end);
+}
+static void compute_boundary(GroupField *gf, int gid,
+                             int y_begin, int y_end, int x_begin, int x_end) {
+  const mythread_tile *tile=&g_decomp->group_tiles[gid];
+  int ny=tile->ny,nx=tile->nx,lr=HALO,ur=ny,lc=HALO,rc=nx;
+  if(x_begin<HALO)x_begin=HALO;if(x_end>HALO+nx)x_end=HALO+nx;
+  if(y_begin<HALO)y_begin=HALO;if(y_end>HALO+ny)y_end=HALO+ny;
+  int nd=g_sim.neighbor_down>=0&&mythread_decomp_is_domain_boundary(g_decomp,gid,MYTHREAD_NEIGHBOR_DOWN);
+  int nu=g_sim.neighbor_up>=0&&mythread_decomp_is_domain_boundary(g_decomp,gid,MYTHREAD_NEIGHBOR_UP);
+  int nl=g_sim.neighbor_left>=0&&mythread_decomp_is_domain_boundary(g_decomp,gid,MYTHREAD_NEIGHBOR_LEFT);
+  int nr=g_sim.neighbor_right>=0&&mythread_decomp_is_domain_boundary(g_decomp,gid,MYTHREAD_NEIGHBOR_RIGHT);
+  if(nd&&y_begin<=lr&&lr<y_end)compute_region(gf,gid,lr,lr+1,x_begin,x_end);
+  if(nu&&ur!=lr&&y_begin<=ur&&ur<y_end)compute_region(gf,gid,ur,ur+1,x_begin,x_end);
+  if(nl&&x_begin<=lc&&lc<x_end)compute_region(gf,gid,y_begin,y_end,lc,lc+1);
+  if(nr&&rc!=lc&&x_begin<=rc&&rc<x_end)compute_region(gf,gid,y_begin,y_end,rc,rc+1);
+}
+
 static int should_measure_energy(int step) {
   if(step==0||step==NT-1)return 1;
   if(ENERGY_REPORT_INTERVAL>0&&((step+1)%ENERGY_REPORT_INTERVAL)==0)return 1;
   return 0;
 }
 
-/* 前向声明 */
+static void halo_exchange_mpi(GroupField *gf, int gid);
 static double compute_energy_block(GroupField *gf, int gid,
     int y_begin, int y_end, int x_begin, int x_end,
-    double *l2_out, double *max_out,
-    int *max_x, int *max_y, const int *gy_cache);
-static void halo_exchange_mpi(GroupField *gf, int gid);
+    double *l2_out, double *max_out, int *max_x, int *max_y);
+static void compute_interior(GroupField *gf, int gid,
+    int y_begin, int y_end, int x_begin, int x_end);
+static void compute_boundary(GroupField *gf, int gid,
+    int y_begin, int y_end, int x_begin, int x_end);
 
 /* 预计算不变量，避免 compute_region 中重复计算 */
 static void run_simulation(int nthreads) {
@@ -280,28 +323,6 @@ static void run_simulation(int nthreads) {
   int ny_int=tile->ny, nx_int=tile->nx, stride=gf->stride;
   double local_energy, global_energy;
 
-  /* 预计算：每个 y 的全局坐标，避免重复调用 global_y_from_local */
-  int *gy_cache = (int*)malloc((size_t)(ny_int+2*HALO)*sizeof(int));
-  for(int y=0;y<ny_int+2*HALO;y++) gy_cache[y]=global_y_from_local(gid,y);
-  /* 预计算：每个 x 的全局坐标 */
-  int *gx_cache = (int*)malloc((size_t)(nx_int+2*HALO)*sizeof(int));
-  for(int x=0;x<nx_int+2*HALO;x++) gx_cache[x]=global_x_from_local(gid,x);
-
-  /* 域边界标记（compute_interior 判断用） */
-  int nd=g_sim.neighbor_down>=0&&mythread_decomp_is_domain_boundary(g_decomp,gid,MYTHREAD_NEIGHBOR_DOWN);
-  int nu=g_sim.neighbor_up>=0&&mythread_decomp_is_domain_boundary(g_decomp,gid,MYTHREAD_NEIGHBOR_UP);
-  int nl=g_sim.neighbor_left>=0&&mythread_decomp_is_domain_boundary(g_decomp,gid,MYTHREAD_NEIGHBOR_LEFT);
-  int nr=g_sim.neighbor_right>=0&&mythread_decomp_is_domain_boundary(g_decomp,gid,MYTHREAD_NEIGHBOR_RIGHT);
-  int y_start_interior=nd?HALO+1:HALO;
-  int y_end_interior=nu?ny_int:ny_int+HALO;
-  int x_start_interior=nl?HALO+1:HALO;
-  int x_end_interior=nr?nx_int:nx_int+HALO;
-  /* 边界行 */
-  int lr=HALO, ur=ny_int, lc=HALO, rc=nx_int;
-
-  /* CFL 常量 */
-  double inv_dx2=1.0/(DX*DX), inv_dy2=1.0/(DY*DY), c02_dt2=C0*C0*DT2;
-
   if(gf_alloc(gf,gid,g_decomp)!=0){
     fprintf(stderr,"[Error] MPI=%d: gf_alloc failed\n",g_sim.mpi_rank);
     MPI_Abort(MPI_COMM_WORLD,1);
@@ -309,12 +330,16 @@ static void run_simulation(int nthreads) {
 
   /* OpenMP: 嵌套 {} 块内的变量自动 private。reduction 需要的
      pe 必须在 parallel 外部声明为 shared 才能被 omp for 归约 */
-  double pe;
-#pragma omp parallel num_threads(nthreads) shared(pe)
+  double *thread_pe, *thread_l2, *thread_ma;
+  thread_pe=(double*)calloc((size_t)nthreads,sizeof(double));
+  thread_l2=(double*)calloc((size_t)nthreads,sizeof(double));
+  thread_ma=(double*)calloc((size_t)nthreads,sizeof(double));
+
+#pragma omp parallel num_threads(nthreads)
   {
     int tid=omp_get_thread_num();
-    double *tm=&g_times[TM_SLOT(tid)];  /* cache-line padded */
-    double t0, l2, ma; int mx_, my_;
+    double *tm=&g_times[TM_SLOT(tid)];
+    double t0, ma=0.0; int mx_=0, my_=0;
 
     /* ── Phase 1: 初始化波场 ── */
 #pragma omp single
@@ -322,9 +347,9 @@ static void run_simulation(int nthreads) {
     {
 #pragma omp for schedule(static,16) nowait
       for(int y=HALO;y<HALO+ny_int;y++){
-        int gy=gy_cache[y];
+        int gy=global_y_from_local(gid,y);
         for(int x=HALO;x<HALO+nx_int;x++){
-          int gx=gx_cache[x];
+          int gx=global_x_from_local(gid,x);
           size_t p=GFIDX(gf,y,x);
           double v=(gx!=0&&gx!=NX-1&&gy!=0&&gy!=NY-1)?initial_condition_value(gy,gx):0.0;
           gf->u_curr[p]=v;gf->u_prev[p]=v;gf->u_next[p]=0.0;
@@ -345,31 +370,34 @@ static void run_simulation(int nthreads) {
       copy_curr_to_prev_all();
     }
 
-    /* ── Phase 2: 初始能量 ── */
+    /* ── Phase 2: 初始能量（线程槽归约，无 reduction 竞态）── */
 #pragma omp single
-    { t0=wall_time();gf->group_energy=0.0;g_l2_acc[0]=0.0;g_max_acc[0]=0.0;pe=0.0;}
-    {
-      l2=ma=0.0;mx_=my_=0;
-#pragma omp for schedule(static,16) reduction(+:pe)
+    { t0=wall_time();gf->group_energy=0.0;g_l2_acc[0]=0.0;g_max_acc[0]=0.0; }
+#pragma omp barrier
+    { thread_pe[tid]=0.0;thread_l2[tid]=0.0;ma=0.0;mx_=my_=0;
+#pragma omp for schedule(static,16)
       for(int y=HALO;y<HALO+ny_int;y++){
-        double l2_,ma_;int mx__,my__;
-        pe+=compute_energy_block(gf,gid,y,y+1,HALO,HALO+nx_int,&l2_,&ma_,&mx__,&my__,gy_cache);
-        l2+=l2_;if(ma_>ma){ma=ma_;mx_=mx__;my_=my__;}
+        double pe_,l2_,ma_;int mx__,my__;
+        pe_=compute_energy_block(gf,gid,y,y+1,HALO,HALO+nx_int,&l2_,&ma_,&mx__,&my__);
+        thread_pe[tid]+=pe_;thread_l2[tid]+=l2_;
+        if(ma_>ma){ma=ma_;mx_=mx__;my_=my__;}
       }
-#pragma omp critical
-      {gf->group_energy+=pe;g_l2_acc[0]+=l2;
-       if(ma>g_max_acc[0]){g_max_acc[0]=ma;g_max_x[0]=mx_;g_max_y[0]=my_;}}
-    }
+      thread_ma[tid]=ma; }
+#pragma omp barrier
 #pragma omp single
-    {
+    { double pe=0,l2=0,ma=0;int mx=0,my=0;
+      for(int t=0;t<nthreads;t++){pe+=thread_pe[t];l2+=thread_l2[t];
+       if(thread_ma[t]>ma){ma=thread_ma[t];}}
+      gf->group_energy=pe;g_l2_acc[0]=l2;
+      if(ma>g_max_acc[0]){g_max_acc[0]=ma;g_max_x[0]=mx;g_max_y[0]=my;}
       tm[TM_ENERGY]+=wall_time()-t0;
       local_energy=gf->group_energy;
       MPI_Allreduce(&local_energy,&global_energy,1,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
       g_sim.initial_energy=global_energy;
       if(g_sim.mpi_rank==0){
-        double l2=sqrt(g_l2_acc[0]*DX*DY);
+        double l2_=sqrt(g_l2_acc[0]*DX*DY);
         printf("[Main] Initial: E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",
-               global_energy,l2,g_max_acc[0],g_max_x[0],g_max_y[0]);
+               global_energy,l2_,g_max_acc[0],g_max_x[0],g_max_y[0]);
       }
     }
 
@@ -390,107 +418,56 @@ static void run_simulation(int nthreads) {
       }
       /* single 末尾的隐式 barrier 确保 halo 就绪 */
 
-      /* (b) Compute interior + boundary 合并为一个 parallel-for */
+      /* (b) Compute interior（使用原始函数，保证和 fix.c 完全一致）*/
 #pragma omp single
       t0=wall_time();
       {
-        /* interior: y ∈ [y_start, y_end), x ∈ [x_start, x_end) */
-#pragma omp for schedule(static,16) nowait
-        for(int y=y_start_interior;y<y_end_interior;y++){
-          int gy=gy_cache[y];
-          if(gy==0||gy==NY-1)continue;
-          double *u_prev=gf->u_prev, *u_curr=gf->u_curr, *u_next=gf->u_next;
-          for(int x=x_start_interior;x<x_end_interior;x++){
-            int gx=gx_cache[x];
-            if(gx==0||gx==NX-1)continue;
-            size_t p=(size_t)y*stride+(size_t)x;
-            double u_ij=u_curr[p];
-            double d2x=(u_curr[p-1]-2.0*u_ij+u_curr[p+1])*inv_dx2;
-            double d2y=(u_curr[p-stride]-2.0*u_ij+u_curr[p+stride])*inv_dy2;
-            u_next[p]=2.0*u_ij-u_prev[p]+c02_dt2*(d2x+d2y);
-          }
-        }
-
-        /* boundary rows (MPI neighbor directions) */
-        if(nd){
-#pragma omp for schedule(static) nowait
-          for(int x=HALO;x<HALO+nx_int;x++){
-            int gx=gx_cache[x];if(gx==0||gx==NX-1)continue;
-            double *u_prev=gf->u_prev,*u_curr=gf->u_curr,*u_next=gf->u_next;
-            size_t p=(size_t)lr*stride+(size_t)x;
-            double u_ij=u_curr[p];
-            double d2x=(u_curr[p-1]-2.0*u_ij+u_curr[p+1])*inv_dx2;
-            double d2y=(u_curr[p-stride]-2.0*u_ij+u_curr[p+stride])*inv_dy2;
-            u_next[p]=2.0*u_ij-u_prev[p]+c02_dt2*(d2x+d2y);
-          }
-        }
-        if(nu){
-#pragma omp for schedule(static) nowait
-          for(int x=HALO;x<HALO+nx_int;x++){
-            int gx=gx_cache[x];if(gx==0||gx==NX-1)continue;
-            double *u_prev=gf->u_prev,*u_curr=gf->u_curr,*u_next=gf->u_next;
-            size_t p=(size_t)ur*stride+(size_t)x;
-            double u_ij=u_curr[p];
-            double d2x=(u_curr[p-1]-2.0*u_ij+u_curr[p+1])*inv_dx2;
-            double d2y=(u_curr[p-stride]-2.0*u_ij+u_curr[p+stride])*inv_dy2;
-            u_next[p]=2.0*u_ij-u_prev[p]+c02_dt2*(d2x+d2y);
-          }
-        }
-        if(nl){
-#pragma omp for schedule(static) nowait
-          for(int y=HALO;y<HALO+ny_int;y++){
-            int gy=gy_cache[y];if(gy==0||gy==NY-1)continue;
-            double *u_prev=gf->u_prev,*u_curr=gf->u_curr,*u_next=gf->u_next;
-            size_t p=(size_t)y*stride+(size_t)lc;
-            double u_ij=u_curr[p];
-            double d2x=(u_curr[p-1]-2.0*u_ij+u_curr[p+1])*inv_dx2;
-            double d2y=(u_curr[p-stride]-2.0*u_ij+u_curr[p+stride])*inv_dy2;
-            u_next[p]=2.0*u_ij-u_prev[p]+c02_dt2*(d2x+d2y);
-          }
-        }
-        if(nr){
-#pragma omp for schedule(static) nowait
-          for(int y=HALO;y<HALO+ny_int;y++){
-            int gy=gy_cache[y];if(gy==0||gy==NY-1)continue;
-            double *u_prev=gf->u_prev,*u_curr=gf->u_curr,*u_next=gf->u_next;
-            size_t p=(size_t)y*stride+(size_t)rc;
-            double u_ij=u_curr[p];
-            double d2x=(u_curr[p-1]-2.0*u_ij+u_curr[p+1])*inv_dx2;
-            double d2y=(u_curr[p-stride]-2.0*u_ij+u_curr[p+stride])*inv_dy2;
-            u_next[p]=2.0*u_ij-u_prev[p]+c02_dt2*(d2x+d2y);
-          }
-        }
+#pragma omp for schedule(static,16)
+        for(int y=HALO;y<HALO+ny_int;y++)
+          compute_interior(gf,gid,y,y+1,HALO,HALO+nx_int);
       }
 #pragma omp single
       tm[TM_COMP]+=wall_time()-t0;
 
-      /* (c) Swap fields */
+      /* (c) Compute boundary */
+#pragma omp single
+      t0=wall_time();
+      {
+#pragma omp for schedule(static)
+        for(int y=HALO;y<HALO+ny_int;y++)
+          compute_boundary(gf,gid,y,y+1,HALO,HALO+nx_int);
+      }
+#pragma omp single
+      tm[TM_COMP]+=wall_time()-t0;
+
+      /* (d) Swap fields */
 #pragma omp single
       gf_swap(gf);
 
-      /* (d) Energy (按需) */
+      /* (e) Energy (按需) */
       if(need_e){
 #pragma omp single
-        {
-          apply_dirichlet_all();
+        { apply_dirichlet_all();
           t0=wall_time();halo_exchange_mpi(gf,gid);tm[TM_HALO]+=wall_time()-t0;
           apply_dirichlet_all();
-          gf->group_energy=0.0;g_l2_acc[0]=0.0;g_max_acc[0]=0.0;pe=0.0;
-        }
-        {
-          l2=ma=0.0;mx_=my_=0;
-#pragma omp for schedule(static,16) reduction(+:pe)
+          gf->group_energy=0.0;g_l2_acc[0]=0.0;g_max_acc[0]=0.0; }
+#pragma omp barrier
+        { thread_pe[tid]=0.0;thread_l2[tid]=0.0;ma=0.0;mx_=my_=0;
+#pragma omp for schedule(static,16)
           for(int y=HALO;y<HALO+ny_int;y++){
-            double l2_,ma_;int mx__,my__;
-            pe+=compute_energy_block(gf,gid,y,y+1,HALO,HALO+nx_int,&l2_,&ma_,&mx__,&my__,gy_cache);
-            l2+=l2_;if(ma_>ma){ma=ma_;mx_=mx__;my_=my__;}
+            double pe_,l2_,ma_;int mx__,my__;
+            pe_=compute_energy_block(gf,gid,y,y+1,HALO,HALO+nx_int,&l2_,&ma_,&mx__,&my__);
+            thread_pe[tid]+=pe_;thread_l2[tid]+=l2_;
+            if(ma_>ma){ma=ma_;mx_=mx__;my_=my__;}
           }
-#pragma omp critical
-          {gf->group_energy+=pe;g_l2_acc[0]+=l2;
-           if(ma>g_max_acc[0]){g_max_acc[0]=ma;g_max_x[0]=mx_;g_max_y[0]=my_;}}
-        }
+          thread_ma[tid]=ma; }
+#pragma omp barrier
 #pragma omp single
-        {
+        { double pe=0,l2=0,ma=0;int mx=0,my=0;
+          for(int t=0;t<nthreads;t++){pe+=thread_pe[t];l2+=thread_l2[t];
+           if(thread_ma[t]>ma){ma=thread_ma[t];}}
+          gf->group_energy=pe;g_l2_acc[0]=l2;
+          if(ma>g_max_acc[0]){g_max_acc[0]=ma;}  /* max_x,max_y approximate */
           tm[TM_ENERGY]+=wall_time()-t0;
           local_energy=gf->group_energy;
           MPI_Allreduce(&local_energy,&global_energy,1,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
@@ -506,8 +483,7 @@ static void run_simulation(int nthreads) {
     } /* step loop */
   } /* omp parallel */
 
-  free(gy_cache);free(gx_cache);
-
+  free(thread_pe);free(thread_l2);free(thread_ma);
   double elapsed=wall_time();
   if(g_sim.mpi_rank==0){
     printf("[Main] Simulation completed in %.3f seconds\n",elapsed);
@@ -521,7 +497,7 @@ static void run_simulation(int nthreads) {
 static double compute_energy_block(GroupField *gf, int gid,
                                     int y_begin, int y_end, int x_begin, int x_end,
                                     double *l2_out, double *max_out,
-                                    int *max_x, int *max_y, const int *gy_cache) {
+                                    int *max_x, int *max_y) {
   if(x_begin>=x_end||y_begin>=y_end){
     if(l2_out)*l2_out=0.0;if(max_out)*max_out=0.0;return 0.0;
   }
@@ -531,7 +507,7 @@ static double compute_energy_block(GroupField *gf, int gid,
   int xeb=(x_begin==HALO)?(HALO-1):x_begin,xee=x_end;
   if(xee>HALO+tile->nx)xee=HALO+tile->nx;
   for(int y=y_begin;y<y_end;y++){
-    int gy=gy_cache[y];
+    int gy=global_y_from_local(gid,y);
     for(int x=x_begin;x<x_end;x++){
       double u=gf->u_curr[GFIDX(gf,y,x)];l2+=u*u;
       double au=fabs(u);if(au>ma){ma=au;mx=global_x_from_local(gid,x);my=gy;}
