@@ -538,7 +538,8 @@ static void print_timing_report(int mr,int ms,int nt){
 
 int main(int argc,char**argv){
   int mpi_rank,mpi_size,node_size,local_ready=1,global_ready=1;
-  MPI_Init(&argc,&argv);
+  int provided;
+  MPI_Init_thread(&argc,&argv,MPI_THREAD_MULTIPLE,&provided);
   MPI_Comm_rank(MPI_COMM_WORLD,&mpi_rank);MPI_Comm_size(MPI_COMM_WORLD,&mpi_size);
   MPI_Comm nc;MPI_Comm_split_type(MPI_COMM_WORLD,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&nc);
   MPI_Comm_size(nc,&node_size);
