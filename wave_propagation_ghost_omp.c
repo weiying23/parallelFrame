@@ -265,6 +265,13 @@ static int should_measure_energy(int step) {
   return 0;
 }
 
+/* 前向声明 */
+static double compute_energy_block(GroupField *gf, int gid,
+    int y_begin, int y_end, int x_begin, int x_end,
+    double *l2_out, double *max_out,
+    int *max_x, int *max_y, const int *gy_cache);
+static void halo_exchange_mpi(GroupField *gf, int gid);
+
 /* 预计算不变量，避免 compute_region 中重复计算 */
 static void run_simulation(int nthreads) {
   int gid=0;
@@ -300,11 +307,14 @@ static void run_simulation(int nthreads) {
     MPI_Abort(MPI_COMM_WORLD,1);
   }
 
-#pragma omp parallel num_threads(nthreads)
+  /* OpenMP: 嵌套 {} 块内的变量自动 private。reduction 需要的
+     pe 必须在 parallel 外部声明为 shared 才能被 omp for 归约 */
+  double pe;
+#pragma omp parallel num_threads(nthreads) shared(pe)
   {
     int tid=omp_get_thread_num();
     double *tm=&g_times[TM_SLOT(tid)];  /* cache-line padded */
-    double t0;
+    double t0, l2, ma; int mx_, my_;
 
     /* ── Phase 1: 初始化波场 ── */
 #pragma omp single
@@ -337,9 +347,9 @@ static void run_simulation(int nthreads) {
 
     /* ── Phase 2: 初始能量 ── */
 #pragma omp single
-    { t0=wall_time();gf->group_energy=0.0;g_l2_acc[0]=0.0;g_max_acc[0]=0.0;}
+    { t0=wall_time();gf->group_energy=0.0;g_l2_acc[0]=0.0;g_max_acc[0]=0.0;pe=0.0;}
     {
-      double l2=0.0,ma=0.0,pe=0.0;int mx_=0,my_=0;
+      l2=ma=0.0;mx_=my_=0;
 #pragma omp for schedule(static,16) reduction(+:pe)
       for(int y=HALO;y<HALO+ny_int;y++){
         double l2_,ma_;int mx__,my__;
@@ -465,10 +475,10 @@ static void run_simulation(int nthreads) {
           apply_dirichlet_all();
           t0=wall_time();halo_exchange_mpi(gf,gid);tm[TM_HALO]+=wall_time()-t0;
           apply_dirichlet_all();
-          gf->group_energy=0.0;g_l2_acc[0]=0.0;g_max_acc[0]=0.0;
+          gf->group_energy=0.0;g_l2_acc[0]=0.0;g_max_acc[0]=0.0;pe=0.0;
         }
         {
-          double l2=0.0,ma=0.0,pe=0.0;int mx_=0,my_=0;
+          l2=ma=0.0;mx_=my_=0;
 #pragma omp for schedule(static,16) reduction(+:pe)
           for(int y=HALO;y<HALO+ny_int;y++){
             double l2_,ma_;int mx__,my__;
