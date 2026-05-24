@@ -487,11 +487,14 @@ static double accumulate_worker_energy(void) {
   }
   return e;
 }
-static double accumulate_l2(void) {
+static double local_l2_sum(void) {
   double s=0.0;
   if (uses_group_threads()) { for (int g=0; g<g_decomp->n_groups; g++) s+=g_group_l2[g]; }
   else s=g_l2_acc;
-  return sqrt(s * DX * DY);
+  return s;
+}
+static double accumulate_l2(void) {
+  return sqrt(local_l2_sum() * DX * DY);
 }
 static void reduce_max_amp(double *amp, int *gx, int *gy) {
   *amp=0.0; *gx=*gy=0;
@@ -639,6 +642,8 @@ static void group_main_thread(void) {
   t0=wall_time(); gWaitMain(initial_energy_state()); task->t_wait_energy0+=wall_time()-t0;
   t0=wall_time();
   g_gfields[gid].group_energy = 0.0;
+  g_group_l2[gid] = 0.0;
+  g_group_max[gid] = 0.0; g_group_max_x[gid] = g_group_max_y[gid] = 0;
   mt_taskpool_begin(slot); submit_energy_tasks(slot, plan);
   mt_taskpool_close(slot); mt_taskpool_wait(slot);
   task->t_work_energy0+=wall_time()-t0; gSetMain(initial_energy_state());
@@ -663,6 +668,8 @@ static void group_main_thread(void) {
       t0=wall_time(); gWaitMain(es); task->t_wait_energy+=wall_time()-t0;
       t0=wall_time();
       g_gfields[gid].group_energy = 0.0;
+      g_group_l2[gid] = 0.0;
+      g_group_max[gid] = 0.0; g_group_max_x[gid] = g_group_max_y[gid] = 0;
       mt_taskpool_begin(slot); submit_energy_tasks(slot, plan);
       mt_taskpool_close(slot); mt_taskpool_wait(slot);
       task->t_work_energy+=wall_time()-t0; task->energy_steps+=1; gSetMain(es);
@@ -694,7 +701,7 @@ static void ungrouped_main(void) {
   t0=wall_time(); MPI_Allreduce(&local_e,&global_e,1,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
   task->t_allreduce+=wall_time()-t0; g_sim.initial_energy=global_e;
   { /* L2 & max|u|: MPI-reduce */
-    double local_l2 = accumulate_l2(), global_l2_sum;
+    double local_l2 = local_l2_sum(), global_l2_sum;
     MPI_Allreduce(&local_l2, &global_l2_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     double global_l2 = sqrt(global_l2_sum * DX * DY);
     double local_ma; int lmx, lmy; reduce_max_amp(&local_ma, &lmx, &lmy);
@@ -737,7 +744,7 @@ static void ungrouped_main(void) {
       task->t_allreduce+=wall_time()-t0; task->energy_steps+=1;
       if (mpi_id==0) {
         double ct=MPI_Wtime()-prev_time; prev_time=MPI_Wtime();
-        double local_l2 = accumulate_l2(), global_l2_sum;
+        double local_l2 = local_l2_sum(), global_l2_sum;
         MPI_Allreduce(&local_l2, &global_l2_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         double global_l2 = sqrt(global_l2_sum * DX * DY);
         double local_ma = g_max_amp; int lgx = g_max_amp_gx, lgy = g_max_amp_gy;
@@ -782,7 +789,7 @@ static void main_thread(void) {
   t0_val=wall_time(); MPI_Allreduce(&local_e,&global_e,1,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
   task->t_allreduce+=wall_time()-t0_val; g_sim.initial_energy=global_e;
   { /* L2 & max|u|: MPI-reduce */
-    double local_l2 = accumulate_l2(), global_l2_sum;
+    double local_l2 = local_l2_sum(), global_l2_sum;
     MPI_Allreduce(&local_l2, &global_l2_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     double global_l2 = sqrt(global_l2_sum * DX * DY);
     double local_ma; int lmx, lmy; reduce_max_amp(&local_ma, &lmx, &lmy);
@@ -825,7 +832,7 @@ static void main_thread(void) {
       task->t_allreduce+=wall_time()-t0_val; task->energy_steps+=1;
       if (mpi_id==0) {
         double ct=MPI_Wtime()-prev_time; prev_time=MPI_Wtime();
-        double local_l2 = accumulate_l2(), global_l2_sum;
+        double local_l2 = local_l2_sum(), global_l2_sum;
         MPI_Allreduce(&local_l2, &global_l2_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         double global_l2 = sqrt(global_l2_sum * DX * DY);
         double local_ma; int lmx, lmy; reduce_max_amp(&local_ma, &lmx, &lmy);
