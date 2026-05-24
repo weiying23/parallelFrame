@@ -691,11 +691,23 @@ static void ungrouped_main(void) {
 
   t0=wall_time(); g_energy_acc=g_l2_acc=g_max_amp=0.0; pool_dispatch_flat(slot, task_compute_energy);
   double local_e=g_energy_acc, global_e; task->t_wait_energy0+=wall_time()-t0;
-  double l2=accumulate_l2(), ma; int max,may; reduce_max_amp(&ma,&max,&may);
   t0=wall_time(); MPI_Allreduce(&local_e,&global_e,1,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
   task->t_allreduce+=wall_time()-t0; g_sim.initial_energy=global_e;
-  if (mpi_id==0) printf("[Main] Initial: E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",
-                         g_sim.initial_energy,l2,ma,max,may);
+  { /* L2 & max|u|: MPI-reduce */
+    double local_l2 = accumulate_l2(), global_l2_sum;
+    MPI_Allreduce(&local_l2, &global_l2_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    double global_l2 = sqrt(global_l2_sum * DX * DY);
+    double local_ma; int lmx, lmy; reduce_max_amp(&local_ma, &lmx, &lmy);
+    double global_ma;
+    MPI_Allreduce(&local_ma, &global_ma, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    int has_max = (local_ma >= global_ma) ? mpi_id : -1, winner;
+    MPI_Allreduce(&has_max, &winner, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    int gx = lmx, gy = lmy;
+    MPI_Bcast(&gx, 1, MPI_INT, winner, MPI_COMM_WORLD);
+    MPI_Bcast(&gy, 1, MPI_INT, winner, MPI_COMM_WORLD);
+    if (mpi_id==0) printf("[Main] Initial: E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",
+                           g_sim.initial_energy, global_l2, global_ma, gx, gy);
+  }
 
   double start_time=MPI_Wtime(), prev_time=start_time;
   for (int step=0; step<NT; step++) {
@@ -725,7 +737,18 @@ static void ungrouped_main(void) {
       task->t_allreduce+=wall_time()-t0; task->energy_steps+=1;
       if (mpi_id==0) {
         double ct=MPI_Wtime()-prev_time; prev_time=MPI_Wtime();
-        printf("[Main] Step %4d/%d, time %.3f,  E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",step+1,NT,ct,global_e,accumulate_l2(),g_max_amp,g_max_amp_gx,g_max_amp_gy);
+        double local_l2 = accumulate_l2(), global_l2_sum;
+        MPI_Allreduce(&local_l2, &global_l2_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        double global_l2 = sqrt(global_l2_sum * DX * DY);
+        double local_ma = g_max_amp; int lgx = g_max_amp_gx, lgy = g_max_amp_gy;
+        double global_ma;
+        MPI_Allreduce(&local_ma, &global_ma, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        int has_max = (local_ma >= global_ma) ? mpi_id : -1, winner;
+        MPI_Allreduce(&has_max, &winner, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        int gx = lgx, gy = lgy;
+        MPI_Bcast(&gx, 1, MPI_INT, winner, MPI_COMM_WORLD);
+        MPI_Bcast(&gy, 1, MPI_INT, winner, MPI_COMM_WORLD);
+        printf("[Main] Step %4d/%d, time %.3f,  E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",step+1,NT,ct,global_e,global_l2,global_ma,gx,gy);
       }
     }
   }
@@ -755,12 +778,24 @@ static void main_thread(void) {
   t0=wall_time(); start_phase_from_main(initial_energy_state()); wait_phase_from_main(initial_energy_state());
   task->t_wait_energy0+=wall_time()-t0;
   t0_val=wall_time(); local_e=accumulate_worker_energy(); task->t_work_energy0+=wall_time()-t0_val;
-  double l2_=accumulate_l2(), ma_; int max_, may_; reduce_max_amp(&ma_,&max_,&may_);
 
   t0_val=wall_time(); MPI_Allreduce(&local_e,&global_e,1,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
   task->t_allreduce+=wall_time()-t0_val; g_sim.initial_energy=global_e;
-  if (mpi_id==0) printf("[Main] Initial: E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",
-                         g_sim.initial_energy,l2_,ma_,max_,may_);
+  { /* L2 & max|u|: MPI-reduce */
+    double local_l2 = accumulate_l2(), global_l2_sum;
+    MPI_Allreduce(&local_l2, &global_l2_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    double global_l2 = sqrt(global_l2_sum * DX * DY);
+    double local_ma; int lmx, lmy; reduce_max_amp(&local_ma, &lmx, &lmy);
+    double global_ma;
+    MPI_Allreduce(&local_ma, &global_ma, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    int has_max = (local_ma >= global_ma) ? mpi_id : -1, winner;
+    MPI_Allreduce(&has_max, &winner, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    int gx = lmx, gy = lmy;
+    MPI_Bcast(&gx, 1, MPI_INT, winner, MPI_COMM_WORLD);
+    MPI_Bcast(&gy, 1, MPI_INT, winner, MPI_COMM_WORLD);
+    if (mpi_id==0) printf("[Main] Initial: E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",
+                           g_sim.initial_energy, global_l2, global_ma, gx, gy);
+  }
 
   double start_time=MPI_Wtime(), prev_time=start_time;
   for (int step=0; step<NT; step++) {
@@ -786,12 +821,22 @@ static void main_thread(void) {
 
       t0=wall_time(); start_phase_from_main(es); wait_phase_from_main(es); task->t_wait_energy+=wall_time()-t0;
       t0_val=wall_time(); local_e=accumulate_worker_energy(); task->t_work_energy+=wall_time()-t0_val;
-      double l2=accumulate_l2(), ma; int max,may; reduce_max_amp(&ma,&max,&may);
       t0_val=wall_time(); MPI_Allreduce(&local_e,&global_e,1,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
       task->t_allreduce+=wall_time()-t0_val; task->energy_steps+=1;
       if (mpi_id==0) {
         double ct=MPI_Wtime()-prev_time; prev_time=MPI_Wtime();
-        printf("[Main] Step %4d/%d, time %.3f,  E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",step+1,NT,ct,global_e,l2,ma,max,may);
+        double local_l2 = accumulate_l2(), global_l2_sum;
+        MPI_Allreduce(&local_l2, &global_l2_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        double global_l2 = sqrt(global_l2_sum * DX * DY);
+        double local_ma; int lmx, lmy; reduce_max_amp(&local_ma, &lmx, &lmy);
+        double global_ma;
+        MPI_Allreduce(&local_ma, &global_ma, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        int has_max = (local_ma >= global_ma) ? mpi_id : -1, winner;
+        MPI_Allreduce(&has_max, &winner, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        int gx = lmx, gy = lmy;
+        MPI_Bcast(&gx, 1, MPI_INT, winner, MPI_COMM_WORLD);
+        MPI_Bcast(&gy, 1, MPI_INT, winner, MPI_COMM_WORLD);
+        printf("[Main] Step %4d/%d, time %.3f,  E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",step+1,NT,ct,global_e,global_l2,global_ma,gx,gy);
       }
     }
   }

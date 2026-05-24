@@ -1333,7 +1333,8 @@ int main(int argc, char **argv) {
     printf("Group decomp      : %s\n",
            g_decomp->policy == MYTHREAD_DECOMP_Y_ONLY ? "Y_ONLY" : "XY_2D");
     printf("Group grid        : %d x %d\n", g_decomp->gx, g_decomp->gy);
-    printf("CFL               : x=%.4f y=%.4f\n", CFL_X, CFL_Y);
+    printf("DT=%.4f DX=%.4f CFL: x=%.4f y=%.4f sum2=%.6f\n",
+           cfg_DT, DX, CFL_X, CFL_Y, CFL_SUM2);
     printf("============================================\n");
   }
 

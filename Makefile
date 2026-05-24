@@ -13,7 +13,7 @@ MYTHREAD_SRC = mythread/mythread_util.c \
                mythread/mythread_field.c \
                mythread/mythread_halo.c \
                mythread/mythread_config.c
-TARGETS = wave_propagation wave_propagation_ghost tests/taskpool_tests tests/test_bindcpu tests/test_field tests/test_config tests/test_decomp tests/test_locv tests/test_sync tests/test_timer tests/test_util
+TARGETS = wave_propagation_ghost wave_propagation_ghost_fix tests/taskpool_tests tests/test_bindcpu tests/test_field tests/test_config tests/test_decomp tests/test_locv tests/test_sync tests/test_timer tests/test_util
 
 .PHONY: all clean run_simple run_full run_wave run_ghost run_visual run_taskpool_tests run_bindcpu_tests debug
 
@@ -55,10 +55,10 @@ tests/test_timer: tests/test_timer.c $(MYTHREAD_SRC)
 tests/test_util: tests/test_util.c $(MYTHREAD_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-wave_propagation: wave_propagation.c $(MYTHREAD_SRC)
+wave_propagation_ghost: wave_propagation_ghost.c $(MYTHREAD_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-wave_propagation_ghost: wave_propagation_ghost.c $(MYTHREAD_SRC)
+wave_propagation_ghost_fix: wave_propagation_ghost_fix.c $(MYTHREAD_SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 wave_visual: wave_visual.c $(MYTHREAD_SRC)
