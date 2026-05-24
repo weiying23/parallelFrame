@@ -1021,18 +1021,22 @@ static void main_thread(void) {
     double global_l2_sum;
     MPI_Allreduce(&local_l2, &global_l2_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     double global_l2 = sqrt(global_l2_sum * DX * DY);
-    /* max|u|: MPI-reduce position-aware */
+    /* max|u|: MPI-reduce position-aware.  Use separate MPI_MAX on double
+       (avoids MPI_DOUBLE_INT struct-padding portability issues), then
+       broadcast coordinates from the winning rank.  All ranks must
+       participate in MPI_Bcast regardless of who holds the max. */
     double local_ma; int lmx, lmy; reduce_max_amp(&local_ma, &lmx, &lmy);
-    struct { double v; int r; } in = {local_ma, mpi_id}, out;
-    MPI_Allreduce(&in, &out, 1, MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+    double global_ma;
+    MPI_Allreduce(&local_ma, &global_ma, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    int has_max = (local_ma >= global_ma) ? mpi_id : -1;
+    int winner;
+    MPI_Allreduce(&has_max, &winner, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
     int gx = lmx, gy = lmy;
-    if (out.r != mpi_id) {
-      MPI_Bcast(&gx, 1, MPI_INT, out.r, MPI_COMM_WORLD);
-      MPI_Bcast(&gy, 1, MPI_INT, out.r, MPI_COMM_WORLD);
-    }
+    MPI_Bcast(&gx, 1, MPI_INT, winner, MPI_COMM_WORLD);
+    MPI_Bcast(&gy, 1, MPI_INT, winner, MPI_COMM_WORLD);
     if (mpi_id == 0)
       printf("[Main] Initial: E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",
-             g_sim.initial_energy, global_l2, out.v, gx, gy);
+             g_sim.initial_energy, global_l2, global_ma, gx, gy);
   }
 
   start_time = MPI_Wtime();
@@ -1102,17 +1106,18 @@ static void main_thread(void) {
         double global_l2_sum;
         MPI_Allreduce(&local_l2, &global_l2_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         double global_l2 = sqrt(global_l2_sum * DX * DY);
-        /* max|u|: MPI-reduce position-aware */
+        /* max|u|: MPI-reduce position-aware (same safe pattern as initial) */
         double local_ma; int lmx, lmy; reduce_max_amp(&local_ma, &lmx, &lmy);
-        struct { double v; int r; } in2 = {local_ma, mpi_id}, out2;
-        MPI_Allreduce(&in2, &out2, 1, MPI_DOUBLE_INT, MPI_MAXLOC, MPI_COMM_WORLD);
+        double global_ma;
+        MPI_Allreduce(&local_ma, &global_ma, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        int has_max2 = (local_ma >= global_ma) ? mpi_id : -1;
+        int winner2;
+        MPI_Allreduce(&has_max2, &winner2, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
         int gx = lmx, gy = lmy;
-        if (out2.r != mpi_id) {
-          MPI_Bcast(&gx, 1, MPI_INT, out2.r, MPI_COMM_WORLD);
-          MPI_Bcast(&gy, 1, MPI_INT, out2.r, MPI_COMM_WORLD);
-        }
+        MPI_Bcast(&gx, 1, MPI_INT, winner2, MPI_COMM_WORLD);
+        MPI_Bcast(&gy, 1, MPI_INT, winner2, MPI_COMM_WORLD);
         printf("[Main] Step %4d/%d, time %.3f,  E=%.6f L2=%.6f max|u|=%.6f@(%d,%d)\n",
-               step + 1, NT, compute_time, global_energy, global_l2, out2.v, gx, gy);
+               step + 1, NT, compute_time, global_energy, global_l2, global_ma, gx, gy);
       }
     }
   }
