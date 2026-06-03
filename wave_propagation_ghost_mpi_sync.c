@@ -1,5 +1,6 @@
 #include <math.h>
 #include <mpi.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,7 +11,7 @@ static int    cfg_NX=14000,cfg_NY=14000,cfg_NT=480;
 static double cfg_A=10.0,cfg_DT=0.001,cfg_C0=0.1;
 static int    cfg_USE_FIXED_DOMAIN=0;
 static double cfg_DX,cfg_DY,cfg_LX,cfg_LY,cfg_DT2,cfg_CFL_X,cfg_CFL_Y,cfg_CFL_SUM2;
-static int    cfg_HALO=1,cfg_N_GROUPS=2,cfg_N_WORKERS=2;
+static int    cfg_HALO=1,cfg_N_GROUPS=2,cfg_N_WORKERS=2,cfg_GROUP_DECOMP=0;
 static int    cfg_NCorePClu=5,cfg_NCluPNode=2,cfg_NCorePGrp=4,cfg_ManageCoreId=4;
 static int    cfg_CoreOffset=0,cfg_ClustOffset=0;
 
@@ -34,175 +35,143 @@ static void cfg_compute_derived(void){
 #define CFL_SUM2 cfg_CFL_SUM2
 
 typedef struct {
-  double *u_prev,*u_curr,*u_next;
-  int ny_padded,nx_padded,stride; size_t plane_bytes;
-  double *send_up,*recv_up,*send_down,*recv_down;
-  double *send_left,*recv_left,*send_right,*recv_right;
-} Field;
-
-#define F(f,y,x) ((size_t)(y)*(size_t)(f)->stride+(size_t)(x))
-
-typedef struct {
   int mx,my,nx,ny,mr,ms,px,py,px_id,py_id;
   int nb_l,nb_r,nb_d,nb_u;
 } Dom;
 
 static Dom g_d={0};
-static Field g_f={0};
+static GroupField *g_gfields=NULL;
 static const mythread_decomp *g_dc=NULL;
+static mythread_mpi_ctx g_mpi_ctx={0};
 
 typedef struct {
   int gid,tid;
   int y_begin,y_end,x_begin,x_end;
+  GroupField *gf;
   double partial_energy;
 } ThreadTask;
 
 int _gettdsize_(void){return (int)sizeof(ThreadTask);}
 int _getgdsize_(void){return 0;}
 
-static inline int gx(int lx){return g_d.mx+(g_dc->group_tiles[0].x_begin+lx-HALO);}
-static inline int gy(int ly){return g_d.my+(g_dc->group_tiles[0].y_begin+ly-HALO);}
+static inline int gx(int gid,int lx){return g_d.mx+(g_dc->group_tiles[gid].x_begin+lx-HALO);}
+static inline int gy(int gid,int ly){return g_d.my+(g_dc->group_tiles[gid].y_begin+ly-HALO);}
 
 static int init_state(void){return 1;}
-static int compute_state(int step){return 2*step+2;}
-static int boundary_state(int step){return 2*step+3;}
-static int energy_state(void){return 2*NT+4;}
+static int copy_state(void){return 2;}
+static int compute_state(int step){return 2*step+3;}
+static int boundary_state(int step){return 2*step+4;}
+static int energy_state(void){return 2*NT+5;}
 
-static int f_alloc(Field*f){
-  const mythread_tile*t=&g_dc->group_tiles[0];int h=HALO,nx=t->nx,ny=t->ny;
-  memset(f,0,sizeof(*f));f->ny_padded=ny+2*h;f->nx_padded=nx+2*h;f->stride=f->nx_padded;
-  f->plane_bytes=(size_t)f->ny_padded*(size_t)f->nx_padded*sizeof(double);
-#define AL(p,sz) do{(p)=(double*)calloc((sz),sizeof(double));if(!(p))goto fail;}while(0)
-  AL(f->u_prev,(size_t)f->ny_padded*f->nx_padded);
-  AL(f->u_curr,(size_t)f->ny_padded*f->nx_padded);
-  AL(f->u_next,(size_t)f->ny_padded*f->nx_padded);
-  if(g_d.nb_u>=0||(g_dc->n_groups>1&&mythread_decomp_is_domain_boundary(g_dc,0,MYTHREAD_NEIGHBOR_UP))){AL(f->send_up,nx);AL(f->recv_up,nx);}
-  if(g_d.nb_d>=0||(g_dc->n_groups>1&&mythread_decomp_is_domain_boundary(g_dc,0,MYTHREAD_NEIGHBOR_DOWN))){AL(f->send_down,nx);AL(f->recv_down,nx);}
-  if(g_d.nb_l>=0||(g_dc->n_groups>1&&mythread_decomp_is_domain_boundary(g_dc,0,MYTHREAD_NEIGHBOR_LEFT))){AL(f->send_left,ny);AL(f->recv_left,ny);}
-  if(g_d.nb_r>=0||(g_dc->n_groups>1&&mythread_decomp_is_domain_boundary(g_dc,0,MYTHREAD_NEIGHBOR_RIGHT))){AL(f->send_right,ny);AL(f->recv_right,ny);}
-#undef AL
-  return 0;
-fail:
-  free(f->u_prev);free(f->u_curr);free(f->u_next);
-  free(f->send_up);free(f->recv_up);free(f->send_down);free(f->recv_down);
-  free(f->send_left);free(f->recv_left);free(f->send_right);free(f->recv_right);
-  memset(f,0,sizeof(*f));return-1;
-}
-static void f_free(Field*f){if(!f)return;
-  free(f->u_prev);free(f->u_curr);free(f->u_next);
-  free(f->send_up);free(f->recv_up);free(f->send_down);free(f->recv_down);
-  free(f->send_left);free(f->recv_left);free(f->send_right);free(f->recv_right);
-  memset(f,0,sizeof(*f));}
-static void f_swap(Field*f){if(!f)return;
-  double*t=f->u_prev;f->u_prev=f->u_curr;f->u_curr=f->u_next;f->u_next=t;}
-
-static void apply_d(Field*f){
-  const mythread_tile*t=&g_dc->group_tiles[0];int s=f->stride,h=f->ny_padded,nx=t->nx,ny=t->ny;
-  if(g_d.mx==0)for(int y=0;y<h;y++)f->u_curr[F(f,y,HALO)]=0.0;
-  if(g_d.mx+g_d.nx==NX){int xr=HALO+nx-1;for(int y=0;y<h;y++)f->u_curr[F(f,y,xr)]=0.0;}
-  if(g_d.nb_l<0)for(int y=0;y<h;y++)f->u_curr[F(f,y,0)]=0.0;
-  if(g_d.nb_r<0){int xh=HALO+nx;for(int y=0;y<h;y++)f->u_curr[F(f,y,xh)]=0.0;}
-  if(g_d.nb_d<0){memset(&f->u_curr[0],0,(size_t)s*sizeof(double));
-    if(g_d.my==0)memset(&f->u_curr[F(f,HALO,0)],0,(size_t)s*sizeof(double));}
-  if(g_d.nb_u<0){memset(&f->u_curr[(ny+HALO)*s],0,(size_t)s*sizeof(double));
-    if(g_d.my+g_d.ny==NY)memset(&f->u_curr[F(f,ny,0)],0,(size_t)s*sizeof(double));}
-}
-
-static void halo_x(Field*f){
-  int nx=g_dc->group_tiles[0].nx,ny=g_dc->group_tiles[0].ny,s=f->stride,tag=100,tag_lr=200;
-  MPI_Request r[8];int nr=0;
-  if(g_d.nb_u>=0&&f->send_up){
-    memcpy(f->send_up,&f->u_curr[ny*s+HALO],(size_t)nx*sizeof(double));
-    MPI_Isend(f->send_up,nx,MPI_DOUBLE,g_d.nb_u,tag,MPI_COMM_WORLD,&r[nr++]);
-    MPI_Irecv(f->recv_up,nx,MPI_DOUBLE,g_d.nb_u,tag+1,MPI_COMM_WORLD,&r[nr++]);}
-  if(g_d.nb_d>=0&&f->send_down){
-    memcpy(f->send_down,&f->u_curr[HALO*s+HALO],(size_t)nx*sizeof(double));
-    MPI_Isend(f->send_down,nx,MPI_DOUBLE,g_d.nb_d,tag+1,MPI_COMM_WORLD,&r[nr++]);
-    MPI_Irecv(f->recv_down,nx,MPI_DOUBLE,g_d.nb_d,tag,MPI_COMM_WORLD,&r[nr++]);}
-  if(g_d.nb_r>=0&&f->send_right){
-    int xr=HALO+nx-1;
-    for(int y=0;y<ny;y++)f->send_right[y]=f->u_curr[(HALO+y)*s+xr];
-    MPI_Isend(f->send_right,ny,MPI_DOUBLE,g_d.nb_r,tag_lr,MPI_COMM_WORLD,&r[nr++]);
-    MPI_Irecv(f->recv_right,ny,MPI_DOUBLE,g_d.nb_r,tag_lr+1,MPI_COMM_WORLD,&r[nr++]);}
-  if(g_d.nb_l>=0&&f->send_left){
-    for(int y=0;y<ny;y++)f->send_left[y]=f->u_curr[(HALO+y)*s+HALO];
-    MPI_Isend(f->send_left,ny,MPI_DOUBLE,g_d.nb_l,tag_lr+1,MPI_COMM_WORLD,&r[nr++]);
-    MPI_Irecv(f->recv_left,ny,MPI_DOUBLE,g_d.nb_l,tag_lr,MPI_COMM_WORLD,&r[nr++]);}
-  MPI_Waitall(nr,r,MPI_STATUSES_IGNORE);
-  if(f->recv_up)memcpy(&f->u_curr[(ny+HALO)*s+HALO],f->recv_up,(size_t)nx*sizeof(double));
-  if(f->recv_down)memcpy(&f->u_curr[0*s+HALO],f->recv_down,(size_t)nx*sizeof(double));
-  if(f->recv_right){int xh=HALO+nx;for(int y=0;y<ny;y++)f->u_curr[(HALO+y)*s+xh]=f->recv_right[y];}
-  if(f->recv_left)for(int y=0;y<ny;y++)f->u_curr[(HALO+y)*s+0]=f->recv_left[y];
-}
-
-static double init_val(int gy,int gx){
+static double init_val(int gy_,int gx_){
   double cx=0.5*(cfg_USE_FIXED_DOMAIN?1.0:((cfg_NX-1)*cfg_DX)),
          cy=0.5*(cfg_USE_FIXED_DOMAIN?1.0:((cfg_NY-1)*cfg_DY)),
          sigma=0.06*((cfg_USE_FIXED_DOMAIN?1.0:(cfg_DX*(cfg_NX-1)))<(cfg_USE_FIXED_DOMAIN?1.0:(cfg_DY*(cfg_NY-1)))?
            (cfg_USE_FIXED_DOMAIN?1.0:(cfg_DX*(cfg_NX-1))):(cfg_USE_FIXED_DOMAIN?1.0:(cfg_DY*(cfg_NY-1))));
-  return AA*exp(-((gx*DX-cx)*(gx*DX-cx)+(gy*DY-cy)*(gy*DY-cy))/(2.*sigma*sigma));
+  return AA*exp(-((gx_*DX-cx)*(gx_*DX-cx)+(gy_*DY-cy)*(gy_*DY-cy))/(2.*sigma*sigma));
 }
 
-static void comp_interior_block(Field*f,int y_begin,int y_end,int x_begin,int x_end){
-  const mythread_tile*t=&g_dc->group_tiles[0];int ny=t->ny,nx=t->nx;
-  int yb=HALO,ye=HALO+ny,xb=HALO,xe=HALO+nx;
-  const int gx_base=g_d.mx+t->x_begin-HALO,gy_base=g_d.my+t->y_begin-HALO;
-  const double inv_dx2=1.0/(DX*DX),inv_dy2=1.0/(DY*DY),c2dt2=C0*C0*DT2;
-  if(g_d.nb_d>=0)yb=HALO+1;
-  if(g_d.nb_u>=0)ye=ny;
-  if(yb<y_begin)yb=y_begin;if(ye>y_end)ye=y_end;
-  if(xb<x_begin)xb=x_begin;if(xe>x_end)xe=x_end;
-  for(int y=yb;y<ye;y++){int gy_=gy_base+y;if(gy_==0||gy_==NY-1)continue;
-    for(int x=xb;x<xe;x++){int gx_=gx_base+x;if(gx_==0||gx_==NX-1)continue;
-      double u=f->u_curr[F(f,y,x)];
-      double d2x=(f->u_curr[F(f,y,x-1)]-2*u+f->u_curr[F(f,y,x+1)])*inv_dx2;
-      double d2y=(f->u_curr[F(f,y-1,x)]-2*u+f->u_curr[F(f,y+1,x)])*inv_dy2;
-      f->u_next[F(f,y,x)]=2*u-f->u_prev[F(f,y,x)]+c2dt2*(d2x+d2y);}}
+static void gf_apply_d(GroupField*gf,int gid){
+  const mythread_tile*t=&g_dc->group_tiles[gid];
+  int s=gf->stride,h=gf->ny_padded,nx=t->nx,ny=t->ny;
+  int global_x0=g_d.mx+t->x_begin,global_x1=g_d.mx+t->x_end;
+  int global_y0=g_d.my+t->y_begin,global_y1=g_d.my+t->y_end;
+
+  if(global_x0==0)for(int y=0;y<h;y++)gf->u_curr[GFIDX(gf,y,HALO)]=0.0;
+  if(global_x1==NX){int xr=HALO+nx-1;for(int y=0;y<h;y++)gf->u_curr[GFIDX(gf,y,xr)]=0.0;}
+
+  if(g_d.nb_l<0&&mythread_decomp_is_domain_boundary(g_dc,gid,MYTHREAD_NEIGHBOR_LEFT))
+    for(int y=0;y<h;y++)gf->u_curr[GFIDX(gf,y,0)]=0.0;
+  if(g_d.nb_r<0&&mythread_decomp_is_domain_boundary(g_dc,gid,MYTHREAD_NEIGHBOR_RIGHT)){
+    int xh=HALO+nx;for(int y=0;y<h;y++)gf->u_curr[GFIDX(gf,y,xh)]=0.0;
+  }
+
+  if(g_d.nb_d<0&&mythread_decomp_is_domain_boundary(g_dc,gid,MYTHREAD_NEIGHBOR_DOWN)){
+    memset(&gf->u_curr[0],0,(size_t)s*sizeof(double));
+    if(global_y0==0)memset(&gf->u_curr[GFIDX(gf,HALO,0)],0,(size_t)s*sizeof(double));
+  }
+  if(g_d.nb_u<0&&mythread_decomp_is_domain_boundary(g_dc,gid,MYTHREAD_NEIGHBOR_UP)){
+    memset(&gf->u_curr[(ny+HALO)*s],0,(size_t)s*sizeof(double));
+    if(global_y1==NY)memset(&gf->u_curr[GFIDX(gf,ny,0)],0,(size_t)s*sizeof(double));
+  }
 }
 
-static void comp_boundary_block(Field*f,int y_begin,int y_end,int x_begin,int x_end){
-  const mythread_tile*t=&g_dc->group_tiles[0];int ny=t->ny,nx=t->nx;
-  int lr=HALO,ur=ny;
-  const int gx_base=g_d.mx+t->x_begin-HALO;
+static void apply_d_all(void){
+  for(int g=0;g<g_dc->n_groups;g++)gf_apply_d(&g_gfields[g],g);
+}
+
+static void halo_all(void){
+  mythread_halo_exchange_intra(g_gfields,g_dc);
+  mythread_halo_exchange_mpi(g_gfields,g_dc,&g_mpi_ctx,(uintptr_t)MPI_COMM_WORLD);
+}
+
+static void copy_prev_block(GroupField*gf,int gid,int y_begin,int y_end){
+  const mythread_tile*t=&g_dc->group_tiles[gid];
+  if(y_begin==HALO)
+    memcpy(&gf->u_prev[GFIDX(gf,0,0)],&gf->u_curr[GFIDX(gf,0,0)],
+           (size_t)gf->stride*sizeof(double));
+  for(int y=y_begin;y<y_end;y++)
+    memcpy(&gf->u_prev[GFIDX(gf,y,0)],&gf->u_curr[GFIDX(gf,y,0)],
+           (size_t)gf->stride*sizeof(double));
+  if(y_end==HALO+t->ny)
+    memcpy(&gf->u_prev[GFIDX(gf,HALO+t->ny,0)],&gf->u_curr[GFIDX(gf,HALO+t->ny,0)],
+           (size_t)gf->stride*sizeof(double));
+}
+
+static void gf_swap_all(void){
+  for(int g=0;g<g_dc->n_groups;g++)group_field_swap(&g_gfields[g]);
+}
+
+static void init_field_block(GroupField*gf,int gid,int y_begin,int y_end,int x_begin,int x_end){
+  for(int y=y_begin;y<y_end;y++){int gy_=gy(gid,y);
+    for(int x=x_begin;x<x_end;x++){int gx_=gx(gid,x);
+      double v=(gx_!=0&&gx_!=NX-1&&gy_!=0&&gy_!=NY-1)?init_val(gy_,gx_):0.0;
+      gf->u_curr[GFIDX(gf,y,x)]=v;gf->u_prev[GFIDX(gf,y,x)]=v;gf->u_next[GFIDX(gf,y,x)]=0.0;}}
+}
+
+static void comp_region(GroupField*gf,int gid,int y_begin,int y_end,int x_begin,int x_end){
   const double inv_dx2=1.0/(DX*DX),inv_dy2=1.0/(DY*DY),c2dt2=C0*C0*DT2;
+  for(int y=y_begin;y<y_end;y++){int gy_=gy(gid,y);if(gy_==0||gy_==NY-1)continue;
+    for(int x=x_begin;x<x_end;x++){int gx_=gx(gid,x);if(gx_==0||gx_==NX-1)continue;
+      double u=gf->u_curr[GFIDX(gf,y,x)];
+      double d2x=(gf->u_curr[GFIDX(gf,y,x-1)]-2*u+gf->u_curr[GFIDX(gf,y,x+1)])*inv_dx2;
+      double d2y=(gf->u_curr[GFIDX(gf,y-1,x)]-2*u+gf->u_curr[GFIDX(gf,y+1,x)])*inv_dy2;
+      gf->u_next[GFIDX(gf,y,x)]=2*u-gf->u_prev[GFIDX(gf,y,x)]+c2dt2*(d2x+d2y);}}
+}
+
+static void comp_interior_block(GroupField*gf,int gid,int y_begin,int y_end,int x_begin,int x_end){
+  const mythread_tile*t=&g_dc->group_tiles[gid];int ny=t->ny,nx=t->nx;
+  if(g_d.nb_d>=0&&mythread_decomp_is_domain_boundary(g_dc,gid,MYTHREAD_NEIGHBOR_DOWN)&&y_begin<HALO+1)y_begin=HALO+1;
+  if(g_d.nb_u>=0&&mythread_decomp_is_domain_boundary(g_dc,gid,MYTHREAD_NEIGHBOR_UP)&&y_end>ny)y_end=ny;
+  if(g_d.nb_l>=0&&mythread_decomp_is_domain_boundary(g_dc,gid,MYTHREAD_NEIGHBOR_LEFT)&&x_begin<HALO+1)x_begin=HALO+1;
+  if(g_d.nb_r>=0&&mythread_decomp_is_domain_boundary(g_dc,gid,MYTHREAD_NEIGHBOR_RIGHT)&&x_end>nx)x_end=nx;
+  if(y_begin<y_end&&x_begin<x_end)comp_region(gf,gid,y_begin,y_end,x_begin,x_end);
+}
+
+static void comp_boundary_block(GroupField*gf,int gid,int y_begin,int y_end,int x_begin,int x_end){
+  const mythread_tile*t=&g_dc->group_tiles[gid];int ny=t->ny,nx=t->nx;
+  int lr=HALO,ur=ny,lc=HALO,rc=nx;
   if(x_begin<HALO)x_begin=HALO;if(x_end>HALO+nx)x_end=HALO+nx;
   if(y_begin<HALO)y_begin=HALO;if(y_end>HALO+ny)y_end=HALO+ny;
-  if(g_d.nb_d>=0&&y_begin<=lr&&lr<y_end){
-    for(int x=HALO;x<HALO+nx;x++){
-      if(x<x_begin||x>=x_end)continue;
-      int gx_=gx_base+x;if(gx_==0||gx_==NX-1)continue;
-      double u=f->u_curr[F(f,lr,x)];
-      double d2x=(f->u_curr[F(f,lr,x-1)]-2*u+f->u_curr[F(f,lr,x+1)])*inv_dx2;
-      double d2y=(f->u_curr[F(f,lr-1,x)]-2*u+f->u_curr[F(f,lr+1,x)])*inv_dy2;
-      f->u_next[F(f,lr,x)]=2*u-f->u_prev[F(f,lr,x)]+c2dt2*(d2x+d2y);}
-  }
-  if(g_d.nb_u>=0&&ur!=lr&&y_begin<=ur&&ur<y_end){
-    for(int x=HALO;x<HALO+nx;x++){
-      if(x<x_begin||x>=x_end)continue;
-      int gx_=gx_base+x;if(gx_==0||gx_==NX-1)continue;
-      double u=f->u_curr[F(f,ur,x)];
-      double d2x=(f->u_curr[F(f,ur,x-1)]-2*u+f->u_curr[F(f,ur,x+1)])*inv_dx2;
-      double d2y=(f->u_curr[F(f,ur-1,x)]-2*u+f->u_curr[F(f,ur+1,x)])*inv_dy2;
-      f->u_next[F(f,ur,x)]=2*u-f->u_prev[F(f,ur,x)]+c2dt2*(d2x+d2y);}
-  }
+  if(g_d.nb_d>=0&&mythread_decomp_is_domain_boundary(g_dc,gid,MYTHREAD_NEIGHBOR_DOWN)&&y_begin<=lr&&lr<y_end)
+    comp_region(gf,gid,lr,lr+1,x_begin,x_end);
+  if(g_d.nb_u>=0&&mythread_decomp_is_domain_boundary(g_dc,gid,MYTHREAD_NEIGHBOR_UP)&&y_begin<=ur&&ur<y_end)
+    comp_region(gf,gid,ur,ur+1,x_begin,x_end);
+  if(g_d.nb_l>=0&&mythread_decomp_is_domain_boundary(g_dc,gid,MYTHREAD_NEIGHBOR_LEFT)&&x_begin<=lc&&lc<x_end)
+    comp_region(gf,gid,y_begin,y_end,lc,lc+1);
+  if(g_d.nb_r>=0&&mythread_decomp_is_domain_boundary(g_dc,gid,MYTHREAD_NEIGHBOR_RIGHT)&&x_begin<=rc&&rc<x_end)
+    comp_region(gf,gid,y_begin,y_end,rc,rc+1);
 }
 
-static void init_field_block(Field*f,int y_begin,int y_end,int x_begin,int x_end){
-  for(int y=y_begin;y<y_end;y++){int gy_=gy(y);
-    for(int x=x_begin;x<x_end;x++){int gx_=gx(x);
-      double v=(gx_!=0&&gx_!=NX-1&&gy_!=0&&gy_!=NY-1)?init_val(gy_,gx_):0.0;
-      f->u_curr[F(f,y,x)]=v;f->u_prev[F(f,y,x)]=v;f->u_next[F(f,y,x)]=0.0;}}
-}
-
-static double energy_block(Field*f,int y_begin,int y_end,int x_begin,int x_end){
+static double energy_block(GroupField*gf,int gid,int y_begin,int y_end,int x_begin,int x_end){
   double my_e=0.0;
-  for(int y=y_begin;y<y_end;y++){int gy_=gy(y);if(gy_==0||gy_==NY-1)continue;
-    for(int x=x_begin;x<x_end;x++){int gx_=gx(x);if(gx_==0||gx_==NX-1)continue;
-      double u=f->u_curr[F(f,y,x)],up=f->u_prev[F(f,y,x)];
-      double ut=(u-up)/DT,dxc=(f->u_curr[F(f,y,x+1)]-f->u_curr[F(f,y,x-1)])/(2*DX);
-      double dyc=(f->u_curr[F(f,y+1,x)]-f->u_curr[F(f,y-1,x)])/(2*DY);
-      double dxp=(f->u_prev[F(f,y,x+1)]-f->u_prev[F(f,y,x-1)])/(2*DX);
-      double dyp=(f->u_prev[F(f,y+1,x)]-f->u_prev[F(f,y-1,x)])/(2*DY);
+  for(int y=y_begin;y<y_end;y++){int gy_=gy(gid,y);if(gy_==0||gy_==NY-1)continue;
+    for(int x=x_begin;x<x_end;x++){int gx_=gx(gid,x);if(gx_==0||gx_==NX-1)continue;
+      double u=gf->u_curr[GFIDX(gf,y,x)],up=gf->u_prev[GFIDX(gf,y,x)];
+      double ut=(u-up)/DT,dxc=(gf->u_curr[GFIDX(gf,y,x+1)]-gf->u_curr[GFIDX(gf,y,x-1)])/(2*DX);
+      double dyc=(gf->u_curr[GFIDX(gf,y+1,x)]-gf->u_curr[GFIDX(gf,y-1,x)])/(2*DY);
+      double dxp=(gf->u_prev[GFIDX(gf,y,x+1)]-gf->u_prev[GFIDX(gf,y,x-1)])/(2*DX);
+      double dyp=(gf->u_prev[GFIDX(gf,y+1,x)]-gf->u_prev[GFIDX(gf,y-1,x)])/(2*DY);
       my_e+=0.5*(ut*ut+C0*C0*(dxc*dxp+dyc*dyp))*DX*DY;
     }}
   return my_e;
@@ -219,6 +188,9 @@ static void setup_domain(int mr,int ms){
   g_d.nb_l=(g_d.px_id>0)?(mr-1):-1;g_d.nb_r=(g_d.px_id+1<px)?(mr+1):-1;
   g_d.nb_d=(g_d.py_id>0)?(mr-px):-1;g_d.nb_u=(g_d.py_id+1<py)?(mr+px):-1;
   g_d.mr=mr;g_d.ms=ms;
+  g_mpi_ctx.mpirank_left=g_d.nb_l;g_mpi_ctx.mpirank_right=g_d.nb_r;
+  g_mpi_ctx.mpirank_down=g_d.nb_d;g_mpi_ctx.mpirank_up=g_d.nb_u;
+  g_mpi_ctx.mpi_tag_base=100;
 }
 
 static void cfg_load(const char*cp,const char*hp){
@@ -230,6 +202,7 @@ static void cfg_load(const char*cp,const char*hp){
   cfg_USE_FIXED_DOMAIN=cs?mythread_cfg_get_int(cs,"","USE_FIXED_DOMAIN",cfg_USE_FIXED_DOMAIN):cfg_USE_FIXED_DOMAIN;
   cfg_N_GROUPS=hw?mythread_cfg_get_int(hw,"","N_GROUPS",cfg_N_GROUPS):cfg_N_GROUPS;
   cfg_N_WORKERS=hw?mythread_cfg_get_int(hw,"","N_WORKERS",cfg_N_WORKERS):cfg_N_WORKERS;
+  cfg_GROUP_DECOMP=hw?mythread_cfg_get_int(hw,"","GROUP_DECOMP",cfg_GROUP_DECOMP):cfg_GROUP_DECOMP;
   cfg_NCorePClu=hw?mythread_cfg_get_int(hw,"","NCorePClu",cfg_NCorePClu):cfg_NCorePClu;
   cfg_NCluPNode=hw?mythread_cfg_get_int(hw,"","NCluPNode",cfg_NCluPNode):cfg_NCluPNode;
   cfg_NCorePGrp=hw?mythread_cfg_get_int(hw,"","NCorePGrp",cfg_NCorePGrp):cfg_NCorePGrp;
@@ -239,59 +212,54 @@ static void cfg_load(const char*cp,const char*hp){
   mythread_cfg_free(cs);mythread_cfg_free(hw);cfg_compute_derived();
 }
 
-static void setup_thread_tasks(Field*f,const mythread_tile*t){
-  int ng=md.ngrp;
-  if(ng<1)return;
-  int group_base=t->ny/ng,group_rem=t->ny%ng,group_y=HALO;
-  for(int g=0;g<ng;g++){
+static void setup_thread_tasks(void){
+  for(int g=0;g<md.ngrp;g++){
     threadGroup*pg=md.grps[g];
-    int group_rows=group_base+(g<group_rem?1:0);
-    int group_begin=group_y,group_end=group_begin+group_rows;
+    const mythread_tile*t=&g_dc->group_tiles[g];
     int nworkers=pg->Nthreads-1;
-
     for(int i=0;i<pg->Nthreads;i++){
       ThreadTask*task=(ThreadTask*)pg->threads[i].td;
-      task->gid=g;task->tid=i;
+      task->gid=g;task->tid=i;task->gf=&g_gfields[g];
       task->x_begin=HALO;task->x_end=HALO+t->nx;
-      task->y_begin=group_begin;task->y_end=group_begin;
+      task->y_begin=HALO;task->y_end=HALO;
       task->partial_energy=0.0;
     }
-
     if(nworkers>0){
-      int base=group_rows/nworkers,rem=group_rows%nworkers,y=group_begin;
+      int base=t->ny/nworkers,rem=t->ny%nworkers,y=HALO;
       for(int i=1;i<pg->Nthreads;i++){
         ThreadTask*task=(ThreadTask*)pg->threads[i].td;
         int rows=base+((i-1)<rem?1:0);
-        task->y_begin=y;task->y_end=y+rows;
-        y+=rows;
+        task->y_begin=y;task->y_end=y+rows;y+=rows;
       }
     }
-    group_y=group_end;
   }
-  (void)f;
 }
 
 static void worker_thread(void){
   ThreadTask*task=(ThreadTask*)ti->td;
-  Field*f=&g_f;
+  GroupField*gf=task->gf;int gid=task->gid;
 
   sWaitGrp(init_state());
-  init_field_block(f,task->y_begin,task->y_end,task->x_begin,task->x_end);
+  init_field_block(gf,gid,task->y_begin,task->y_end,task->x_begin,task->x_end);
   sSetGrp(init_state());
+
+  sWaitGrp(copy_state());
+  copy_prev_block(gf,gid,task->y_begin,task->y_end);
+  sSetGrp(copy_state());
 
   for(int step=0;step<NT;step++){
     int cs=compute_state(step),bs=boundary_state(step);
     sWaitGrp(cs);
-    comp_interior_block(f,task->y_begin,task->y_end,task->x_begin,task->x_end);
+    comp_interior_block(gf,gid,task->y_begin,task->y_end,task->x_begin,task->x_end);
     sSetGrp(cs);
 
     sWaitGrp(bs);
-    comp_boundary_block(f,task->y_begin,task->y_end,task->x_begin,task->x_end);
+    comp_boundary_block(gf,gid,task->y_begin,task->y_end,task->x_begin,task->x_end);
     sSetGrp(bs);
   }
 
   sWaitGrp(energy_state());
-  task->partial_energy=energy_block(f,task->y_begin,task->y_end,task->x_begin,task->x_end);
+  task->partial_energy=energy_block(gf,gid,task->y_begin,task->y_end,task->x_begin,task->x_end);
   sSetGrp(energy_state());
 }
 
@@ -308,41 +276,40 @@ static double collect_worker_energy(void){
 }
 
 static void group_main_thread(void){
-  for(int step=-1;step<NT;step++){
-    int state=(step<0)?init_state():compute_state(step);
-    gWaitMain(state);
-    gSetSubs(state);
-    gWaitSubs(state);
-    gSetMain(state);
+  int gid=ti->igrp;
+  ThreadTask*task=(ThreadTask*)ti->td;
+  if(group_alloc_field(&g_gfields[gid],gid,g_dc)!=0){
+    fprintf(stderr,"[E] rank %d gid %d group_alloc_field failed\n",mpi_id,gid);
+    MPI_Abort(MPI_COMM_WORLD,1);
+  }
+  task->gid=gid;task->tid=ti->ind;task->gf=&g_gfields[gid];
 
-    if(step>=0){
-      state=boundary_state(step);
-      gWaitMain(state);
-      gSetSubs(state);
-      gWaitSubs(state);
-      gSetMain(state);
-    }
+  gWaitMain(init_state());gSetSubs(init_state());gWaitSubs(init_state());gSetMain(init_state());
+  gWaitMain(copy_state());gSetSubs(copy_state());gWaitSubs(copy_state());gSetMain(copy_state());
+
+  for(int step=0;step<NT;step++){
+    int cs=compute_state(step),bs=boundary_state(step);
+    gWaitMain(cs);gSetSubs(cs);gWaitSubs(cs);gSetMain(cs);
+    gWaitMain(bs);gSetSubs(bs);gWaitSubs(bs);gSetMain(bs);
   }
 
-  gWaitMain(energy_state());
-  gSetSubs(energy_state());
-  gWaitSubs(energy_state());
-  gSetMain(energy_state());
+  gWaitMain(energy_state());gSetSubs(energy_state());gWaitSubs(energy_state());gSetMain(energy_state());
 }
 
 static void main_thread_run(int mr){
-  Field*f=&g_f;
-
   mSetGrps(init_state());
   mWaitGrps(init_state());
 
-  apply_d(f);halo_x(f);apply_d(f);
-  memcpy(f->u_prev,f->u_curr,f->plane_bytes);
+  group_field_link_buffers(g_gfields,g_dc);
+  apply_d_all();halo_all();apply_d_all();
+
+  mSetGrps(copy_state());
+  mWaitGrps(copy_state());
 
   double t0=MPI_Wtime();
   for(int step=0;step<NT;step++){
     MPI_Barrier(MPI_COMM_WORLD);
-    apply_d(f);halo_x(f);apply_d(f);
+    apply_d_all();halo_all();apply_d_all();
 
     mSetGrps(compute_state(step));
     mWaitGrps(compute_state(step));
@@ -350,7 +317,7 @@ static void main_thread_run(int mr){
     mSetGrps(boundary_state(step));
     mWaitGrps(boundary_state(step));
 
-    f_swap(f);
+    gf_swap_all();
     if(mr==0&&(step+1)%((NT>10?NT/10:1))==0)printf("[Main] Step %d/%d\n",step+1,NT);
   }
   double elapsed=MPI_Wtime()-t0;
@@ -377,6 +344,9 @@ int main(int argc,char**argv){
         *hp=mythread_env_get("WAVE_HARDWARE_CFG","config/hardware.cfg");cfg_load(cp,hp);}
   if(cfg_N_GROUPS<2)cfg_N_GROUPS=2;
   if(cfg_N_WORKERS<1)cfg_N_WORKERS=1;
+  if(cfg_GROUP_DECOMP!=MYTHREAD_DECOMP_Y_ONLY&&mr==0)
+    fprintf(stderr,"[W] wave_propagation_ghost_mpi_sync.c GroupField path is optimized for Y_ONLY; forcing GROUP_DECOMP=0\n");
+  cfg_GROUP_DECOMP=MYTHREAD_DECOMP_Y_ONLY;
   if(NX<3||NY<3){if(mr==0)fprintf(stderr,"[E] NX/NY>=3\n");MPI_Finalize();return 1;}
   if(CFL_SUM2>1.0){if(mr==0)fprintf(stderr,"[E] CFL>1\n");MPI_Finalize();return 1;}
 
@@ -384,8 +354,10 @@ int main(int argc,char**argv){
   if(g_d.nx<=0||g_d.ny<=0)lr=0;
   MPI_Allreduce(&lr,&gr,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD);if(!gr){MPI_Finalize();return 1;}
 
-  g_dc=mythread_decomp_create(g_d.nx,g_d.ny,HALO,1,0,0);
-  if(!g_dc||f_alloc(&g_f)!=0){fprintf(stderr,"[E] init\n");MPI_Finalize();return 1;}
+  g_dc=mythread_decomp_create(g_d.nx,g_d.ny,HALO,cfg_N_GROUPS,cfg_N_WORKERS,MYTHREAD_DECOMP_Y_ONLY);
+  if(!g_dc){fprintf(stderr,"[E] rank %d decomp\n",mr);MPI_Finalize();return 1;}
+  g_gfields=(GroupField*)calloc((size_t)g_dc->n_groups,sizeof(GroupField));
+  if(!g_gfields){fprintf(stderr,"[E] rank %d group fields\n",mr);mythread_decomp_free((mythread_decomp*)g_dc);MPI_Finalize();return 1;}
 
   MPI_Comm node_comm;int node_size=1;
   MPI_Comm_split_type(MPI_COMM_WORLD,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
@@ -396,19 +368,19 @@ int main(int argc,char**argv){
   err=InitThreads(mr,cfg_NCorePClu,cfg_NCluPNode,cfg_NCorePGrp,
                   cfg_N_WORKERS+1,cfg_N_GROUPS,node_size,&manage_core);
   if(err!=0){fprintf(stderr,"[E] rank %d InitThreads failed: %d\n",mr,err);
-    f_free(&g_f);mythread_decomp_free((mythread_decomp*)g_dc);MPI_Comm_free(&node_comm);MPI_Finalize();return 1;}
+    free(g_gfields);mythread_decomp_free((mythread_decomp*)g_dc);MPI_Comm_free(&node_comm);MPI_Finalize();return 1;}
 
-  Field*f=&g_f;const mythread_tile*t=&g_dc->group_tiles[0];
-  setup_thread_tasks(f,t);
+  setup_thread_tasks();
 
-  if(mr==0)printf("=== Wave MPI+mythread-sync %dx%dx%d procs=%d (%dx%d) groups/rank=%d workers/group=%d DT=%.4f CFL=%.4f ===\n",
+  if(mr==0)printf("=== Wave MPI+mythread-sync GroupField %dx%dx%d procs=%d (%dx%d) groups/rank=%d workers/group=%d DT=%.4f CFL=%.4f ===\n",
     NX,NY,NT,ms,g_d.px,g_d.py,cfg_N_GROUPS,cfg_N_WORKERS,cfg_DT,cfg_C0*cfg_DT/cfg_DX);
-  printf("[R%d] domain %dx%d at (%d,%d) nbr L=%d R=%d D=%d U=%d\n",
-    mr,g_d.nx,g_d.ny,g_d.mx,g_d.my,g_d.nb_l,g_d.nb_r,g_d.nb_d,g_d.nb_u);
+  printf("[R%d] domain %dx%d at (%d,%d) nbr L=%d R=%d D=%d U=%d groups=%d\n",
+    mr,g_d.nx,g_d.ny,g_d.mx,g_d.my,g_d.nb_l,g_d.nb_r,g_d.nb_d,g_d.nb_u,g_dc->n_groups);
 
   StartThreads(thread_run);
   thread_run();
   EndThreads();
 
-  f_free(&g_f);mythread_decomp_free((mythread_decomp*)g_dc);MPI_Comm_free(&node_comm);MPI_Finalize();return 0;
+  for(int g=0;g<g_dc->n_groups;g++)group_free_field(&g_gfields[g]);
+  free(g_gfields);mythread_decomp_free((mythread_decomp*)g_dc);MPI_Comm_free(&node_comm);MPI_Finalize();return 0;
 }
