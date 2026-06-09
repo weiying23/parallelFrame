@@ -340,13 +340,14 @@ int main(int argc,char**argv){
   g_dc=mythread_decomp_create(g_d.nx,g_d.ny,HALO,1,0,0);
   if(!g_dc||f_alloc(&g_f)!=0){fprintf(stderr,"[E] init\n");MPI_Finalize();return 1;}
 
-  MPI_Comm node_comm;int node_size=1;
+  MPI_Comm node_comm;int node_size=1,node_rank=0;
   MPI_Comm_split_type(MPI_COMM_WORLD,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
   MPI_Comm_size(node_comm,&node_size);
+  MPI_Comm_rank(node_comm,&node_rank);
 
   int manage_core=cfg_ManageCoreId;
   CoreOffset=cfg_CoreOffset;ClustOffset=cfg_ClustOffset;
-  err=InitThreads(mr,cfg_NCorePClu,cfg_NCluPNode,cfg_NCorePGrp,
+  err=InitThreads(node_rank,cfg_NCorePClu,cfg_NCluPNode,cfg_NCorePGrp,
                   cfg_N_WORKERS+1,1,node_size,&manage_core);
   if(err!=0){fprintf(stderr,"[E] rank %d InitThreads failed: %d\n",mr,err);
     f_free(&g_f);mythread_decomp_free((mythread_decomp*)g_dc);MPI_Comm_free(&node_comm);MPI_Finalize();return 1;}

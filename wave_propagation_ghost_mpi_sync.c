@@ -359,13 +359,14 @@ int main(int argc,char**argv){
   g_gfields=(GroupField*)calloc((size_t)g_dc->n_groups,sizeof(GroupField));
   if(!g_gfields){fprintf(stderr,"[E] rank %d group fields\n",mr);mythread_decomp_free((mythread_decomp*)g_dc);MPI_Finalize();return 1;}
 
-  MPI_Comm node_comm;int node_size=1;
+  MPI_Comm node_comm;int node_size=1,node_rank=0;
   MPI_Comm_split_type(MPI_COMM_WORLD,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,&node_comm);
   MPI_Comm_size(node_comm,&node_size);
+  MPI_Comm_rank(node_comm,&node_rank);
 
   int manage_core=cfg_ManageCoreId;
   CoreOffset=cfg_CoreOffset;ClustOffset=cfg_ClustOffset;
-  err=InitThreads(mr,cfg_NCorePClu,cfg_NCluPNode,cfg_NCorePGrp,
+  err=InitThreads(node_rank,cfg_NCorePClu,cfg_NCluPNode,cfg_NCorePGrp,
                   cfg_N_WORKERS+1,cfg_N_GROUPS,node_size,&manage_core);
   if(err!=0){fprintf(stderr,"[E] rank %d InitThreads failed: %d\n",mr,err);
     free(g_gfields);mythread_decomp_free((mythread_decomp*)g_dc);MPI_Comm_free(&node_comm);MPI_Finalize();return 1;}

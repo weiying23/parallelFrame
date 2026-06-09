@@ -166,7 +166,7 @@ int InitThreads(int mpi_id_,int NCorePClu_,int NCluPNode_,int NCorePGrp_,int NTh
 #define NGG 8
 
 void initmd(void){
-  int i,j,cbase;
+  int i,j,cbase=0;
   if(md.PThreadInited) return;
   memset(&md,0,sizeof(md));
   md.PThreadInited=1;
@@ -250,16 +250,16 @@ void initmd(void){
     gd=gi->gd;
   }else{
     md.idMainThread=1;
+    if(NProcPNode<1)NProcPNode=1;
     int ipr=mpi_id%NProcPNode;
     if(NProcPNode<=NCluPNode){
       cbase=ipr*NCorePClu + ClustOffset*NCorePClu;
     }else{
       int n=NCorePClu/NThPGrp;
-      if(n>1){
-        int icl=ipr/n;
-        int icp=ipr%n;
-        cbase=icl*NCorePClu+icp*NThPGrp;
-      }
+      if(n<1)n=1;
+      int icl=(ipr/n)%NCluPNode;
+      int icp=ipr%n;
+      cbase=icl*NCorePClu+icp*NThPGrp + ClustOffset*NCorePClu;
     }
     ManageCoreId=cbase;
     md.Nthreads=NThPGrp;
@@ -345,6 +345,7 @@ static void zStartThreads(TFunc tfun,void*para,int detach,int clear){
   ti->sync_flag = sync_flag_init;
   md.state = 0;
   ti->Nthreads=md.Nthreads;
+  bindthread();
   if(tfun){
     InitThread(&md.tm,0,0,0,0);
     if(ThreadG){
