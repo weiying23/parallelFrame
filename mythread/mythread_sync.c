@@ -1,5 +1,6 @@
 #include "mythread_sync.h"
 #include "mythread_util.h"
+#include <sched.h>
 #include <stdlib.h>
 
 #ifdef DEBUG
@@ -11,13 +12,23 @@ int GetVInt(int volatile *volatile p){
   return *p;
 }
 
-#define MAXCHECK 10000000
+#define MAXCHECK 1000000000
 #define VLINE ,__LINE__
 #define PLINE ,int nl
+
+static inline void wait_pause(int iter){
+#if defined(__x86_64__) || defined(__i386__)
+  __asm__ __volatile__("pause" ::: "memory");
+#elif defined(__aarch64__) || defined(__arm__)
+  __asm__ __volatile__("yield" ::: "memory");
+#endif
+  if((iter&0x3ff)==0x3ff)sched_yield();
+}
+
 #define FWAIT(NM,COP) int Wait_##NM(volatile int *pv,int cv PLINE){ \
   for(int i=0;GetVInt(pv) COP cv;i++){ \
   if(i>=MAXCHECK){ printf("wait state timeout %d %s %d\n",*pv,#COP,cv);exit(0); }\
-  ntdelay(1); } \
+  wait_pause(i); } \
   return 0;\
 }
 FWAIT(LNE,==);

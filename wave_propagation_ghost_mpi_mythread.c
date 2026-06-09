@@ -63,9 +63,8 @@ static inline int gx(int lx){return g_d.mx+(g_dc->group_tiles[0].x_begin+lx-HALO
 static inline int gy(int ly){return g_d.my+(g_dc->group_tiles[0].y_begin+ly-HALO);}
 
 static int init_state(void){return 1;}
-static int compute_state(int step){return 2*step+2;}
-static int boundary_state(int step){return 2*step+3;}
-static int energy_state(void){return 2*NT+4;}
+static int compute_state(int step){return step+2;}
+static int energy_state(void){return NT+2;}
 
 static int f_alloc(Field*f){
   const mythread_tile*t=&g_dc->group_tiles[0];int h=HALO,nx=t->nx,ny=t->ny;
@@ -186,6 +185,11 @@ static void comp_boundary_block(Field*f,int y_begin,int y_end,int x_begin,int x_
   }
 }
 
+static void comp_step_block(Field*f,int y_begin,int y_end,int x_begin,int x_end){
+  comp_interior_block(f,y_begin,y_end,x_begin,x_end);
+  comp_boundary_block(f,y_begin,y_end,x_begin,x_end);
+}
+
 static void init_field_block(Field*f,int y_begin,int y_end,int x_begin,int x_end){
   for(int y=y_begin;y<y_end;y++){int gy_=gy(y);
     for(int x=x_begin;x<x_end;x++){int gx_=gx(x);
@@ -261,14 +265,10 @@ static void worker_thread(void){
   sSetState(init_state());
 
   for(int step=0;step<NT;step++){
-    int cs=compute_state(step),bs=boundary_state(step);
+    int cs=compute_state(step);
     sWaitState(cs);
-    comp_interior_block(f,task->y_begin,task->y_end,task->x_begin,task->x_end);
+    comp_step_block(f,task->y_begin,task->y_end,task->x_begin,task->x_end);
     sSetState(cs);
-
-    sWaitState(bs);
-    comp_boundary_block(f,task->y_begin,task->y_end,task->x_begin,task->x_end);
-    sSetState(bs);
   }
 
   sWaitState(energy_state());
@@ -301,9 +301,6 @@ static void main_thread_run(int mr){
 
     mSetSubs(compute_state(step));
     mWaitSubs(compute_state(step));
-
-    mSetSubs(boundary_state(step));
-    mWaitSubs(boundary_state(step));
 
     f_swap(f);
     if(mr==0&&(step+1)%((NT>10?NT/10:1))==0)printf("[Main] Step %d/%d\n",step+1,NT);
