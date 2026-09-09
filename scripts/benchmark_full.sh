@@ -44,20 +44,15 @@ log "${BOLD}${CYAN}════════════════════�
 log ""
 
 log "${YELLOW}>>> 编译所有版本...${NC}"
-make clean > /dev/null 2>&1 || true
-CFLAGS="-O3 -D_GNU_SOURCE -I." make wave_propagation_ghost_fix wave_propagation_ghost > /dev/null 2>&1
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1
+cmake --build build -j >/dev/null 2>&1
 log "    fix / ghost 完成"
 
 OMP_OK=0
-if mpicc -O3 -Xpreprocessor -fopenmp -D_GNU_SOURCE -I. \
-       -I/opt/homebrew/opt/libomp/include \
-       -o wave_propagation_ghost_omp \
-       wave_propagation_ghost_omp.c \
-       mythread/mythread_config.c mythread/mythread_decomp.c \
-       -L/opt/homebrew/opt/libomp/lib -lomp -lm 2>/dev/null; then
+if [ -x build/wave_propagation_ghost_omp ]; then
     OMP_OK=1; log "    omp  完成"
 else
-    log "    omp  跳过 (无 libomp)"
+    log "    omp  跳过 (未找到 OpenMP)"
 fi
 log ""
 
@@ -86,7 +81,7 @@ EOF
 
     local t e l2
     local output
-    output=$(eval "$extra WAVE_CASE_CFG=/tmp/bench_case.cfg WAVE_HARDWARE_CFG=config/hardware.cfg mpirun -np $np --allow-run-as-root ./$binary" 2>&1)
+    output=$(eval "$extra WAVE_CASE_CFG=/tmp/bench_case.cfg WAVE_HARDWARE_CFG=config/hardware.cfg mpirun -np $np --allow-run-as-root ./build/$binary" 2>&1)
     t=$(echo "$output" | grep 'Simulation completed\|Total wall' | grep -o '[0-9]*\.[0-9]*' | tail -1)
     e=$(echo "$output" | grep 'Step.*'"$nt" | grep -o 'E=[0-9.]*' | head -1 | cut -d'=' -f2)
     l2=$(echo "$output" | grep 'Initial:' | grep -o 'L2=[0-9.]*' | head -1 | cut -d'=' -f2)

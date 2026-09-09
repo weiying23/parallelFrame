@@ -266,11 +266,28 @@ WAVE_IMBALANCE_WORKER=0 WAVE_IMBALANCE_PCT=30 mpirun ...
 
 ### 9.1 编译
 
+使用 CMake 构建（默认启用 MPI）：
+
 ```bash
-make all
+cmake -S . -B build
+cmake --build build -j
 ```
 
-生成目标：`wave_propagation_ghost`（任务池版）、`wave_propagation_ghost_fix`（固定划分版）。
+需要指定 MPI 编译器时（如华为 HPCKit）：
+
+```bash
+cmake -S . -B build -DCMAKE_C_COMPILER=$MPI_HOME/bin/mpicc
+cmake --build build -j
+```
+
+若不需要 MPI，可关闭 MPI 只构建非 MPI 目标：
+
+```bash
+cmake -S . -B build -DUSE_MPI=OFF
+cmake --build build -j
+```
+
+生成目标：`wave_propagation_ghost`（任务池版）、`wave_propagation_ghost_fix`（固定划分版），及全部单测程序。
 
 编译依赖 `mpicc`、`libpthread`、`libm`。可选 `libnuma`（Linux 上 NUMA 感知分配）。
 
@@ -278,21 +295,22 @@ make all
 
 ```bash
 # 默认参数（从 config/ 读取）
-mpirun -np 4 ./wave_propagation_ghost
-mpirun -np 4 ./wave_propagation_ghost_fix
+mpirun -np 4 ./build/wave_propagation_ghost
+mpirun -np 4 ./build/wave_propagation_ghost_fix
 
 # 不均衡负载测试
-WAVE_IMBALANCE_PCT=50 mpirun -np 1 ./wave_propagation_ghost
+WAVE_IMBALANCE_PCT=50 mpirun -np 1 ./build/wave_propagation_ghost
 ```
 
 ### 9.3 性能测试
 
 ```bash
-# 快速对比（48 测试，~2 分钟）
-./scripts/benchmark.sh quick
+# 简易对比（3 次取中位数，固定 1000x1000）
+./scripts/benchmark.sh
 
-# 完整矩阵
-./scripts/benchmark.sh full
+# 完整矩阵（quick=3 网格 / full=5 网格，各 5 次）
+./scripts/benchmark_full.sh quick
+./scripts/benchmark_full.sh full
 ```
 
 日志保存至 `logs/YYYYMMDD_HHMMSS/`，汇总 CSV 自动生成。

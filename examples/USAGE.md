@@ -62,31 +62,28 @@
 
 ### 编译
 
+使用 CMake 构建（默认启用 MPI）：
+
 ```bash
-make all
+cmake -S . -B build
+cmake --build build -j
 ```
 
-或手动编译：
+若不需要 MPI，可关闭 MPI：
 
 ```bash
-# 简化示例
-mpicc -Wall -O2 -o example_simple example_simple.c mythread/mythread.c -lpthread -lm
-
-# 完整示例
-mpicc -Wall -O2 -o example_mpi_mythread example_mpi_mythread.c mythread/mythread.c -lpthread -lm
+cmake -S . -B build -DUSE_MPI=OFF
+cmake --build build -j
 ```
 
 ### 运行
 
 ```bash
 # 运行简化示例（2个MPI进程）
-make run_simple
-# 或
-mpirun -np 2 ./example_simple
+mpirun -np 2 ./build/example_simple
 
 # 运行完整示例（4个MPI进程）
-make run_full
-# 或
+mpirun -np 4 ./build/example_mpi_mythread
 mpirun -np 4 ./example_mpi_mythread
 ```
 
@@ -303,7 +300,8 @@ void mpi_communication() {
 
 ```c
 // 编译时添加 -DDEBUG 启用调试日志
-make debug
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j
 
 // 查看生成的日志文件
 // MTW_XX_XX_XX.log  (MPI进程_组ID_线程ID)

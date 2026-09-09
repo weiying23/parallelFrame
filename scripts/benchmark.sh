@@ -3,25 +3,22 @@ set -e
 N_RUNS=3
 export WAVE_CASE_CFG="config/case_bench.cfg"
 export WAVE_HARDWARE_CFG="config/hardware_bench.cfg"
+cd "$(dirname "$0")/.."
 
 echo "=== mythread 三版本性能对比 ==="
 echo "网格: 1000x1000, NT=200, 每项跑${N_RUNS}次取中位数"
 echo ""
 
 echo ">>> 编译..."
-cd /Users/flow/projects/parallelFrame/parallelFrame
-make clean >/dev/null 2>&1 || true
-make wave_propagation_ghost_fix wave_propagation_ghost >/dev/null 2>&1
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1
+cmake --build build -j >/dev/null 2>&1
 echo "fix / ghost: OK"
 
 OMP_OK=0
-if mpicc -O3 -D_GNU_SOURCE -I. -o wave_propagation_ghost_omp \
-   wave_propagation_ghost_omp.c \
-   mythread/mythread_config.c mythread/mythread_decomp.c \
-   -L/opt/homebrew/opt/libomp/lib -lomp -lm 2>/dev/null; then
+if [ -x build/wave_propagation_ghost_omp ]; then
     OMP_OK=1; echo "omp: OK"
 else
-    echo "omp: SKIP (no libomp)"
+    echo "omp: SKIP (未找到 OpenMP，跳过)"
 fi
 echo ""
 
@@ -29,7 +26,7 @@ run_bench() {
     local name="$1" binary="$2" np="$3" extra="$4"
     local best=999999
     for i in $(seq 1 $N_RUNS); do
-        t=$(eval "$extra mpirun -np $np --allow-run-as-root ./$binary" 2>&1 | \
+        t=$(eval "$extra mpirun -np $np --allow-run-as-root ./build/$binary" 2>&1 | \
             grep 'Simulation completed\|Total wall' | grep -o '[0-9.]*' | tail -1)
         [ -n "$t" ] && [ "$(echo "$t < $best" | bc -l 2>/dev/null)" = "1" ] && best=$t
     done

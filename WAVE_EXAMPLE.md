@@ -33,29 +33,42 @@ u(t+1,i,j) = 2*u(t,i,j) - u(t-1,i,j) +
 | `wave_propagation.c` | 完整的波传播模拟（高性能版本） |
 | `wave_visual.c` | 带可视化输出的简化版本 |
 | `visualize_wave.py` | Python 可视化脚本 |
-| `Makefile` | 编译脚本 |
+| `CMakeLists.txt` | CMake 构建脚本 |
 
 ## 编译运行
 
 ### 编译
 
+使用 CMake 构建（默认启用 MPI）：
+
 ```bash
-make wave_propagation    # 高性能版本
-make wave_visual         # 可视化版本
+cmake -S . -B build
+cmake --build build -j
+
+# 需要指定 MPI 编译器时
+cmake -S . -B build -DCMAKE_C_COMPILER=mpicc
+cmake --build build -j
+```
+
+若不需要 MPI，可关闭 MPI 只构建非 MPI 目标：
+
+```bash
+cmake -S . -B build -DUSE_MPI=OFF
+cmake --build build -j
 ```
 
 ### 运行
 
 ```bash
 # 运行高性能版本（4个MPI进程）
-mpirun -np 4 ./wave_propagation
+mpirun -np 4 ./build/wave_propagation
 
 # 运行可视化版本（1个进程，输出文件）
-mpirun -np 1 ./wave_visual
+mpirun -np 1 ./build/wave_visual
 
-# 或使用Makefile
-make run_wave
-make run_visual
+# 波动方程 ghost 版本
+mpirun -np 4 ./build/wave_propagation_ghost
+mpirun -np 4 ./build/wave_propagation_ghost_fix
 ```
 
 ### 可视化
